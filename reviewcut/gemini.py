@@ -1,4 +1,4 @@
-"""Client Gemini REST tối giản (văn bản + ảnh) kèm cơ chế dự phòng Ollama Local."""
+"""Client Gemini REST tối giản (văn bản + ảnh) kèm cơ chế dự phòng Ollama Local thông minh."""
 from __future__ import annotations
 
 import base64
@@ -59,7 +59,8 @@ def _ask_ollama_fallback(error_detail: str) -> bool:
         res = messagebox.askyesno(
             "Gemini AI không phản hồi",
             f"Gemini gặp sự cố ({error_detail}).\n\n"
-            f"Bạn có muốn chuyển sang chạy mô hình nội bộ Ollama ({DEFAULT_OLLAMA_MODEL}) để tiếp tục không?"
+            f"Bạn có muốn chuyển TẤT CẢ các phần còn lại sang chạy Ollama ({DEFAULT_OLLAMA_MODEL}) không?\n"
+            "(Hệ thống sẽ ghi nhớ và tự động xử lý, không hỏi lại nữa)"
         )
         root.destroy()
         return bool(res)
@@ -73,7 +74,19 @@ class Gemini:
         self.model = model.strip() if model.strip() else "gemini-1.5-flash"
         self.ollama_model = ollama_model
 
+        # Biến trạng thái: Ghi nhớ quyết định chuyển đổi của người dùng
+        self.use_ollama_only = False
+
     def generate(self, parts: list, json_mode: bool = True, temperature: float = 0.8, timeout: int = 35) -> str:
+        has_image = any(isinstance(p, dict) and "inline_data" in p for p in parts)
+
+        # 1. NẾU ĐÃ ĐỒNG Ý CHUYỂN OLLAMA TỪ TRƯỚC -> Bỏ qua Gemini, gọi thẳng Ollama
+        if self.use_ollama_only and not has_image:
+            prompt_text = _extract_text(parts)
+            if prompt_text.strip():
+                return query_ollama(prompt_text, model=self.ollama_model, json_mode=json_mode)
+
+        # 2. Quy trình gửi API lên Gemini bình thường
         body = {
             "contents": [{"parts": parts}],
             "generationConfig": {"temperature": temperature}
@@ -82,7 +95,6 @@ class Gemini:
             body["generationConfig"]["responseMimeType"] = "application/json"
 
         last_err = ""
-        # Thử gọi Gemini tối đa 2 lần với timeout 35s
         for attempt in range(2):
             try:
                 r = requests.post(
@@ -116,14 +128,16 @@ class Gemini:
             last_err = f"HTTP {r.status_code}: {msg[:200]}"
             break
 
-        # Nếu Gemini thất bại, bật popup hỏi người dùng chuyển sang Ollama
+        # 3. KHI GEMINI LỖI: Hỏi người dùng (nếu trước đó chưa hỏi)
         err_summary = last_err or "Hết thời gian phản hồi"
-        if _ask_ollama_fallback(err_summary):
+
+        if not has_image and _ask_ollama_fallback(err_summary):
+            # CHỐT QUYẾT ĐỊNH: Bật cờ ghi nhớ để các vòng lặp sau tự động chạy Ollama
+            self.use_ollama_only = True
             try:
                 prompt_text = _extract_text(parts)
-                if not prompt_text.strip():
-                    raise RuntimeError("Dữ liệu chỉ có ảnh, không có văn bản prompt để Ollama xử lý.")
-                return query_ollama(prompt_text, model=self.ollama_model, json_mode=json_mode)
+                if prompt_text.strip():
+                    return query_ollama(prompt_text, model=self.ollama_model, json_mode=json_mode)
             except Exception as o_err:
                 raise GeminiError(f"Gemini lỗi ({err_summary}) & Ollama lỗi ({o_err})")
 
