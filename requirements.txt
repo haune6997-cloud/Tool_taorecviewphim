@@ -1,0 +1,6 @@
+faster-whisper>=1.0      # Whisper nghe thoại + timestamp (có thể dùng openai-whisper thay thế)
+edge-tts>=6.1            # giọng đọc tiếng Việt
+opencv-python-headless>=4.8
+numpy>=1.24
+requests>=2.31
+# kiểm thử:  pip install pytest
