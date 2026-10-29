@@ -25,6 +25,7 @@ class Project:
         self.st = st
         stem = re.sub(r"[^\w\-]+", "_", Path(st.video).stem)[:40]
         base = Path(st.workdir) if st.workdir else Path(st.video).parent
+        # Thư mục chứa dữ liệu tạm (cache âm thanh, phân cảnh, bản kế hoạch)
         self.wd = base / f"{stem}_reviewcut"
         self.wd.mkdir(parents=True, exist_ok=True)
         self.scenes: list[analyze.Scene] = []
@@ -97,7 +98,7 @@ class Project:
         # chọn cảnh
         shots = plan_cut(self.scenes, tl, self.lines, st, log=job.log)
         # mô tả thị giác trên đúng các shot đã chọn
-        caption_shots(st.video, shots, str(self.wd), self.gemini(), job)
+        caption_shots(st.video, shots, str(self.wd), None, job)
         self.blocks = make_blocks(shots, self.lines, st)
         self.save()
         total = sum(b.dur for b in self.blocks)
@@ -131,7 +132,21 @@ class Project:
                 items.append((b.text, f))
         tts.synth_many(items, st, job)
         job.check()
-        out = out_path or str(self.wd / f"{Path(st.video).stem}_review.mp4")
+
+        # 1. Xác định thư mục lưu: Ưu tiên ô "Thư mục lưu" trên giao diện (st.workdir)
+        target_dir = Path(st.workdir) if st.workdir else Path(st.video).parent
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        # 2. Xác định tên file: Ưu tiên ô "Tên phim" trên giao diện (st.title)
+        raw_title = getattr(st, "title", "").strip()
+        if raw_title:
+            safe_name = re.sub(r'[\\/*?:"<>|]', "", raw_title)
+            final_filename = f"{safe_name}.mp4"
+        else:
+            final_filename = f"{Path(st.video).stem}_review.mp4"
+
+        # Xuất thẳng ra file hoàn chỉnh tại thư mục đích, không tạo file tạm, không bật popup
+        out = out_path or str(target_dir / final_filename)
         render.render_all(st.video, self.blocks, st, str(self.wd), out, job, files)
         job.log(f"✔ Xuất: {out}")
         return out

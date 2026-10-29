@@ -27,30 +27,38 @@ def clean(text: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
-async def _one(text: str, edge_voice: str, rate: int, pitch: int, out: str, retries: int = 3) -> None:
+async def _one(text: str, edge_voice: str, rate: int, pitch: int, out: str, retries: int = 5) -> None:
     import edge_tts
     last = None
     for a in range(retries):
         try:
             buf = bytearray()
             comm = edge_tts.Communicate(text, edge_voice, rate=f"{rate:+d}%", pitch=f"{pitch:+d}Hz")
+
             async def go():
                 async for ch in comm.stream():
                     if ch["type"] == "audio":
                         buf.extend(ch["data"])
-            await asyncio.wait_for(go(), timeout=60)
+
+            # Giới hạn thời gian tải 1 câu tối đa 40s
+            await asyncio.wait_for(go(), timeout=40)
+
             if len(buf) > 500:
                 Path(out).write_bytes(bytes(buf))
+                # Nghỉ nhẹ 0.3s giữa các câu để tránh kích hoạt tường lửa chống spam
+                await asyncio.sleep(0.3)
                 return
         except Exception as ex:  # noqa: BLE001
             last = ex
-        await asyncio.sleep(1.0 * (a + 1))
+            # Tăng thời gian chờ nếu bị máy chủ Microsoft từ chối (1.5s, 3s, 4.5s...)
+            await asyncio.sleep(1.5 * (a + 1))
+
     raise RuntimeError(f"edge-tts thất bại sau {retries} lần ({type(last).__name__ if last else 'rỗng'}). "
                        "Kiểm tra kết nối Internet.")
 
 
-def synth_many(items: list[tuple[str, str]], st: Settings, job: Job, concurrency: int = 3) -> None:
-    """items = [(text, out_mp3)]. Bỏ qua file đã có (cache)."""
+def synth_many(items: list[tuple[str, str]], st: Settings, job: Job, concurrency: int = 1) -> None:
+    """items = [(text, out_mp3)]. Bỏ qua file đã có (cache). Chạy tuần tự (concurrency=1) để tránh bị chặn."""
     v = VOICES.get(st.resolved_voice(), VOICES["hoaimy"])
     rate, pitch = resolve_prosody(st)
     todo = [(clean(t), o) for t, o in items if t.strip() and not Path(o).exists()]
@@ -58,14 +66,19 @@ def synth_many(items: list[tuple[str, str]], st: Settings, job: Job, concurrency
     async def main():
         sem = asyncio.Semaphore(concurrency)
         done = 0
+
         async def w(t, o):
             nonlocal done
             async with sem:
                 job.check()
                 await _one(t, v["edge"], rate, pitch, o)
                 done += 1
-                job.progress(0.05 + 0.9 * done / max(1, len(todo)), f"Lồng tiếng {done}/{len(todo)}")
-        await asyncio.gather(*(w(t, o) for t, o in todo))
+                job.progress(0.05 + 0.9 * (done / max(1, len(todo))), f"Lồng tiếng {done}/{len(todo)}")
+
+        # Thực thi tuần tự từng câu một
+        for t, o in todo:
+            await w(t, o)
+
     if todo:
         asyncio.run(main())
 

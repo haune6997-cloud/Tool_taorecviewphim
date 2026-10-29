@@ -1,5 +1,6 @@
 """ReviewCut – giao diện: cắt cảnh trước (Whisper + Vision + motion/mặt) → viết kịch bản sau → lồng tiếng & dựng."""
 from __future__ import annotations
+
 # --- VÁ LỖI TỰ ĐỘNG CHO AV / METADATA_ERRORS ---
 import av
 _orig_av_open = av.open
@@ -8,18 +9,21 @@ def _safe_av_open(*args, **kwargs):
     return _orig_av_open(*args, **kwargs)
 av.open = _safe_av_open
 # ---------------------------------------------
+
 import os
 import sys
+
 # Tự động nạp thư viện CUDA cuBLAS vào PATH
 cuda_path = os.path.join(sys.prefix, "Lib", "site-packages", "nvidia", "cublas", "bin")
 if os.path.exists(cuda_path):
     os.add_dll_directory(cuda_path)
     os.environ["PATH"] = cuda_path + os.pathsep + os.environ["PATH"]
-import os
+
+import json
 import queue
+import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import threading
 import tkinter as tk
@@ -40,8 +44,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"ReviewCut {__version__} – Cắt cảnh trước, viết kịch bản sau")
-        self.geometry("1380x900")
-        self.minsize(1100, 700)
+        self.geometry("1420x920")
+        self.minsize(1150, 720)
         self.configure(bg=BG)
         self.st = load_settings()
         self.project: Project | None = None
@@ -75,9 +79,20 @@ class App(tk.Tk):
 
     def _vars(self):
         st = self.st
+        cfg_path = Path.home() / ".reviewcut" / "config.json"
+        extra = {}
+        if cfg_path.is_file():
+            try:
+                extra = json.loads(cfg_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
         V = lambda cls, v: cls(value=v)
         self.v = {
-            "gemini_key": V(tk.StringVar, st.gemini_key), "gemini_model": V(tk.StringVar, st.gemini_model),
+            "groq_key": V(tk.StringVar, extra.get("groq_key", "")),
+            "groq_model": V(tk.StringVar, extra.get("groq_model", "llama-3.3-70b-versatile")),
+            "gemini_key": V(tk.StringVar, st.gemini_key),
+            "gemini_model": V(tk.StringVar, st.gemini_model or "gemini-1.5-flash"),
             "workdir": V(tk.StringVar, st.workdir), "title": V(tk.StringVar, st.title),
             "whisper_model": V(tk.StringVar, st.whisper_model), "whisper_lang": V(tk.StringVar, st.whisper_lang),
             "video": V(tk.StringVar, st.video), "srt_path": V(tk.StringVar, st.srt_path),
@@ -131,7 +146,7 @@ class App(tk.Tk):
         paned.add(left_outer, weight=2)
         right = ttk.Frame(paned)
         paned.add(right, weight=3)
-        self.after(250, lambda: paned.sashpos(0, 540))
+        self.after(250, lambda: paned.sashpos(0, 560))
         self._left(left)
         self._right(right)
 
@@ -150,18 +165,30 @@ class App(tk.Tk):
 
     def _left(self, p):
         v = self.v
-        f = self._card(p, "⚙ Cấu hình API & thư mục")
-        self._row(f, 0, "Gemini Key", lambda x: self._entry_btn(x, v["gemini_key"], None, show="•"))
-        self._row(f, 1, "Model Gemini", lambda x: ttk.Entry(x, textvariable=v["gemini_model"]))
-        self._row(f, 2, "Thư mục lưu", lambda x: self._entry_btn(x, v["workdir"], "dir"))
-        self._row(f, 3, "Tên phim", lambda x: ttk.Entry(x, textvariable=v["title"]))
-        self._row(f, 4, "Whisper model", lambda x: ttk.Combobox(x, textvariable=v["whisper_model"], state="readonly",
+        f = self._card(p, "⚙ Cấu hình AI & Thư mục")
+
+        # Cấu hình Groq (Ưu tiên 1)
+        self._row(f, 0, "Groq API Key", lambda x: self._entry_btn(x, v["groq_key"], None, show="•"))
+        self._row(f, 1, "Model Groq", lambda x: ttk.Combobox(x, textvariable=v["groq_model"],
+            values=["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "qwen-qwq-32b"]))
+
+        # Cấu hình Gemini (Ưu tiên 2)
+        self._row(f, 2, "Gemini Key", lambda x: self._entry_btn(x, v["gemini_key"], None, show="•"))
+        self._row(f, 3, "Model Gemini", lambda x: ttk.Entry(x, textvariable=v["gemini_model"]))
+
+        # Thư mục lưu & Tên phim
+        self._row(f, 4, "Thư mục lưu", lambda x: self._entry_btn(x, v["workdir"], "dir"))
+        self._row(f, 5, "Tên phim", lambda x: ttk.Entry(x, textvariable=v["title"]))
+
+        # Whisper & Phụ đề
+        self._row(f, 6, "Whisper model", lambda x: ttk.Combobox(x, textvariable=v["whisper_model"], state="readonly",
                                                               values=["tiny", "base", "small", "medium", "large-v3"]))
-        self._row(f, 5, "Ngôn ngữ phim", lambda x: ttk.Combobox(x, textvariable=v["whisper_lang"],
+        self._row(f, 7, "Ngôn ngữ phim", lambda x: ttk.Combobox(x, textvariable=v["whisper_lang"],
                                                                 values=["auto", "vi", "en", "zh", "ko", "ja", "th", "fr", "es"]))
-        ttk.Label(f, text="Không có Gemini key vẫn chạy được (mô tả & kịch bản dự phòng chất lượng thấp hơn).",
-                  style="Muted.TLabel", wraplength=440).grid(row=6, column=0, columnspan=2, sticky="w")
-        ttk.Button(f, text="💾 Lưu cấu hình", style="Blue.TButton", command=self._save).grid(row=7, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+
+        ttk.Label(f, text="✦ Thứ tự ưu tiên tự động: Groq (Số 1) ➔ Gemini (Số 2) ➔ Ollama Offline (Phao cứu sinh)",
+                  style="Muted.TLabel", wraplength=460).grid(row=8, column=0, columnspan=2, sticky="w", pady=(2, 4))
+        ttk.Button(f, text="💾 Lưu cấu hình", style="Blue.TButton", command=self._save).grid(row=9, column=0, columnspan=2, sticky="ew", pady=(4, 0))
 
         f = self._card(p, "🎞 Video đầu vào & phân cảnh AI")
         self._row(f, 0, "Video gốc", lambda x: self._entry_btn(x, v["video"], "file", [("Video", "*.mp4 *.mkv *.mov *.avi *.webm *.ts"), ("Tất cả", "*.*")]))
@@ -190,6 +217,7 @@ class App(tk.Tk):
         ttk.Spinbox(r, from_=0, to=1800, width=6, textvariable=v["skip_tail_sec"]).pack(side="left", padx=4)
         ttk.Label(r, text="s (intro/outro)").pack(side="left")
         self._row(f, 7, "", lambda x: r)
+
         self.b1 = ttk.Button(f, text="1. Whisper + Vision: Nhận dạng & CẮT CẢNH", style="Teal.TButton", command=lambda: self._run("1"))
         self.b1.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
@@ -315,7 +343,27 @@ class App(tk.Tk):
         v = self.v
         st = self.st
         g = lambda k: v[k].get()
-        st.gemini_key, st.gemini_model, st.workdir, st.title = g("gemini_key").strip(), g("gemini_model").strip(), g("workdir").strip(), g("title").strip()
+
+        groq_k = g("groq_key").strip()
+        groq_m = g("groq_model").strip()
+        gem_k = g("gemini_key").strip()
+        gem_m = g("gemini_model").strip()
+
+        setattr(st, "groq_key", groq_k)
+        setattr(st, "groq_model", groq_m or "llama-3.3-70b-versatile")
+
+        # Đảm bảo st.gemini_key luôn có giá trị để pipeline kích hoạt bộ não AI
+        if groq_k:
+            st.gemini_key = groq_k
+            st.gemini_model = groq_m or "llama-3.3-70b-versatile"
+        elif gem_k:
+            st.gemini_key = gem_k
+            st.gemini_model = gem_m or "gemini-1.5-flash"
+        else:
+            st.gemini_key = "ollama"
+            st.gemini_model = "qwen2.5:7b"
+
+        st.workdir, st.title = g("workdir").strip(), g("title").strip()
         st.whisper_model, st.whisper_lang = g("whisper_model"), g("whisper_lang")
         st.video, st.srt_path = g("video").strip(), g("srt_path").strip()
         st.extraction_mode, st.target_minutes = g("extraction_mode"), float(g("target_minutes"))
@@ -336,8 +384,20 @@ class App(tk.Tk):
         return st
 
     def _save(self):
-        save_settings(self._collect())
-        messagebox.showinfo("ReviewCut", f"Đã lưu cấu hình (kể cả Gemini key, dạng văn bản thường) tại:\n{Path.home() / '.reviewcut' / 'config.json'}")
+        st = self._collect()
+        save_settings(st)
+        cfg_path = Path.home() / ".reviewcut" / "config.json"
+        if cfg_path.is_file():
+            try:
+                data = json.loads(cfg_path.read_text(encoding="utf-8"))
+                data["groq_key"] = self.v["groq_key"].get().strip()
+                data["groq_model"] = self.v["groq_model"].get().strip()
+                data["gemini_key"] = self.v["gemini_key"].get().strip()
+                data["gemini_model"] = self.v["gemini_model"].get().strip()
+                cfg_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+        messagebox.showinfo("ReviewCut", f"Đã lưu cấu hình AI thành công tại:\n{cfg_path}")
 
     # ------------------------------------------------------------ chạy nền
     def _set_busy(self, b):
@@ -360,7 +420,7 @@ class App(tk.Tk):
                 if not proj.load():
                     raise RuntimeError("Chưa có kết quả bước 1 cho video này – hãy chạy bước 1 trước.")
                 if self.project and self.project.st.video == st.video and self.project.blocks:
-                    proj.blocks = self.project.blocks          # giữ bản chỉnh tay đang hiển thị
+                    proj.blocks = self.project.blocks
             self.project = proj
         except Exception as ex:  # noqa: BLE001
             messagebox.showerror("ReviewCut", str(ex))
@@ -370,19 +430,29 @@ class App(tk.Tk):
 
         def work():
             try:
+                target_dir = Path(st.workdir) if st.workdir else Path(st.video).parent
+                target_dir.mkdir(parents=True, exist_ok=True)
+                raw_title = st.title.strip()
+                if raw_title:
+                    safe_name = re.sub(r'[\\/*?:"<>|]', "", raw_title)
+                    out_path = str(target_dir / f"{safe_name}.mp4")
+                else:
+                    out_path = str(target_dir / f"{Path(st.video).stem}_review.mp4")
+
                 if which == "1":
                     proj.stage1_analyze_and_cut(self.job)
                 elif which == "2":
                     proj.stage2_script(self.job)
                 elif which == "3":
-                    out = proj.stage3_render(self.job)
+                    out = proj.stage3_render(self.job, out_path=out_path)
                     self.q.put(("done_render", out))
                 else:
                     proj.stage1_analyze_and_cut(self.job)
                     self.q.put(("refresh", None))
                     proj.stage2_script(self.job)
                     self.q.put(("refresh", None))
-                    self.q.put(("done_render", proj.stage3_render(self.job)))
+                    out = proj.stage3_render(self.job, out_path=out_path)
+                    self.q.put(("done_render", out))
             except Cancelled:
                 self.q.put(("log", "⏹ Đã dừng."))
             except Exception as ex:  # noqa: BLE001

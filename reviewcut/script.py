@@ -1,4 +1,4 @@
-"""Viết kịch bản lời bình SAU KHI đã cắt cảnh: AI nhìn đúng các shot đã chọn nên lời bình bám chặt hình."""
+"""Viết kịch bản lời bình SAU KHI đã cắt cảnh: Nén ngữ cảnh toàn cục trước, viết từng đoạn sau."""
 from __future__ import annotations
 
 import json
@@ -65,30 +65,77 @@ def offline_text(block: Block, st: Settings, first: bool, last: bool) -> str:
     return " ".join(parts) or "Mọi chuyện tiếp tục diễn biến theo hướng không ai ngờ tới."
 
 
-def _prompt(blocks: list[Block], st: Settings, prev: list[str], first: bool, last: bool) -> str:
+def _summarize_plot(blocks: list[Block], st: Settings, gem: Gemini, job: Job) -> str:
+    """Bước A: Gom toàn bộ lời thoại để AI tóm tắt cốt truyện 1 lần duy nhất (chỉ tốn ~150 từ bộ nhớ)."""
+    seen = set()
+    all_lines = []
+    for b in blocks:
+        for d in b.dialogue:
+            txt = d.get("text", "").strip()
+            if txt and txt not in seen:
+                seen.add(txt)
+                mark = " [NÚT THẮT]" if d.get("plot", 0) >= 0.7 else ""
+                all_lines.append(f"- {txt}{mark}")
+
+    if not all_lines:
+        return ""
+
+    # Giới hạn tối đa 220 câu thoại quan trọng để không làm tràn 6GB VRAM của card đồ họa
+    dialogue_blob = "\n".join(all_lines[:220])
+    prompt = (
+        f"Bạn là biên kịch phân tích phim. Dưới đây là toàn bộ lời thoại của tập phim '{st.title or 'không rõ tên'}' "
+        f"(Thể loại: {st.genre}).\n"
+        "Hãy đọc hiểu và viết 1 đoạn TÓM TẮT CỐT TRUYỆN TỔNG THỂ ngắn gọn (khoảng 120 - 150 từ, viết liền 1 đoạn văn): "
+        "nêu rõ nhân vật chính, mâu thuẫn/âm mưu trung tâm, diễn biến cao trào và kết cục của tập phim.\n"
+        "TUYỆT ĐỐI chỉ trả về đoạn văn tóm tắt tiếng Việt, không chào hỏi, không dùng JSON.\n\n"
+        f"TOÀN BỘ LỜI THOẠI:\n{dialogue_blob}"
+    )
+    try:
+        job.log("   ↳ Đang đọc toàn bộ lời thoại để nắm cốt truyện tổng thể…")
+        summary = gem.generate([{"text": prompt}]).strip()
+        # Làm sạch nếu AI lỡ bọc trong ngoặc kép hoặc markdown
+        summary = re.sub(r"^```[a-zA-Z]*\n|\n```$", "", summary).strip(' "\'\n')
+        if summary:
+            job.log(f"   ★ Tóm tắt cốt truyện: {summary[:120]}…")
+        return summary
+    except Exception as ex:
+        job.log(f"   ⚠️ Bỏ qua bước tóm tắt tổng thể ({ex}), chuyển sang viết trực tiếp.")
+        return ""
+
+
+def _prompt(
+    blocks: list[Block],
+    st: Settings,
+    prev: list[str],
+    first: bool,
+    last: bool,
+    global_summary: str = "",
+) -> str:
     g = st.genre_cfg()
     items = []
     for b in blocks:
+        thoai = [f"{d['text']}" + (" [NÚT THẮT]" if d["plot"] >= 0.7 else "") for d in b.dialogue][:8]
         items.append({
             "id": b.id,
             "seconds": round(b.dur, 1),
             "max_words": max_words(b, st),
-            "loai_canh": sorted({s.kind for s in b.shots if s.kind}),
-            "hinh_anh": [s.caption for s in b.shots if s.caption],
-            "thoai_goc": [f"{d['text']}" + (" [NÚT THẮT]" if d["plot"] >= 0.7 else "") for d in b.dialogue][:8],
+            "thoai_goc": thoai if thoai else ["(Đoạn chuyển cảnh không lời thoại - hãy dẫn dắt nối tiếp mạch truyện)"],
         })
-    ctx = f"Lời bình đã viết ngay trước đó (để nối mạch): {json.dumps(prev[-2:], ensure_ascii=False)}\n" if prev else ""
+
+    summary_ctx = f"TÓM TẮT CỐT TRUYỆN TOÀN TẬP (để nắm bối cảnh chung):\n{global_summary}\n\n" if global_summary else ""
+    prev_ctx = f"Lời bình đã viết ngay trước đó (để nối mạch): {json.dumps(prev[-2:], ensure_ascii=False)}\n" if prev else ""
 
     rules = [
         "Tiếng Việt tự nhiên như người kể chuyện review phim, lôi cuốn, 1–3 câu mỗi đoạn, KHÔNG vượt max_words của đoạn.",
-        "Ưu tiên dựa vào 'thoai_goc' để kể lại diễn biến cốt truyện một cách kịch tính, cuốn hút. Không bịa tình tiết ngoài mạch phim.",
+        "Dựa vào 'TÓM TẮT CỐT TRUYỆN TOÀN TẬP' để hiểu bức tranh lớn (biết rõ mở đầu, cao trào, kết cục), nhưng nội dung từng đoạn phải bám sát 'thoai_goc' của đúng đoạn đó.",
+        "TUYỆT ĐỐI KHÔNG tả cảnh (CẤM viết: cảnh này cho thấy, nhân vật đang đứng, máy quay...).",
         "Thoại gốc có thể là bản dịch thô hoặc ngoại ngữ: hãy chuyển hóa thành lời dẫn hấp dẫn; câu có [NÚT THẮT] nên được nhấn mạnh.",
         "Các đoạn nối tiếp mạch lạc thành một câu chuyện liền mạch, tránh lặp đi lặp lại cùng một kiểu mở đầu.",
     ]
     if first:
-        rules.append("Đoạn đầu tiên phải mở bằng một câu MÓC (hook) gây tò mò, kịch tính.")
+        rules.append("Đoạn đầu tiên phải mở bằng một câu MÓC (hook) gây tò mò, hé lộ kịch tính của toàn tập phim.")
     if last:
-        rules.append("Đoạn cuối cùng chốt bằng cảm xúc, câu hỏi gợi mở hoặc kêu gọi người xem theo dõi tiếp.")
+        rules.append("Đoạn cuối cùng chốt lại cao trào của tập phim, tạo cảm xúc hoặc đặt câu hỏi gợi mở cho tập tiếp theo.")
     rules.append("Không nhắc đến các thuật ngữ kỹ thuật như 'shot', 'đoạn video', 'mô tả hình ảnh', 'thoại gốc'.")
 
     rules_text = "\n".join(f"- {r}" for r in rules)
@@ -97,10 +144,11 @@ def _prompt(blocks: list[Block], st: Settings, prev: list[str], first: bool, las
         "Bạn là biên kịch kênh REVIEW PHIM tiếng Việt chuyên nghiệp. Video đã được CẮT SẴN; hãy viết lời bình cho từng đoạn "
         "sao cho khớp đúng diễn biến câu chuyện và thời lượng của đoạn đó.\n"
         f"Phim: {st.title or '(không rõ tên – chỉ dựa vào dữ liệu bên dưới)'}\n"
-        f"Thể loại: {st.genre}\nPhong cách giọng kể: {g.get('style', 'Kịch tính, cuốn hút')}\n"
-        f"{ctx}"
+        f"Thể loại: {st.genre}\nPhong cách giọng kể: {g.get('style', 'Kịch tính, cuốn hút')}\n\n"
+        f"{summary_ctx}"
+        f"{prev_ctx}"
         f"QUY TẮC:\n{rules_text}\n\n"
-        f"DỮ LIỆU: {json.dumps(items, ensure_ascii=False)}\n\n"
+        f"DỮ LIỆU CÁC ĐOẠN CẦN VIẾT: {json.dumps(items, ensure_ascii=False)}\n\n"
         'TRẢ VỀ JSON: mảng [{"id": <id>, "text": "<lời bình>"}] đủ mọi id theo đúng định dạng JSON hợp lệ.'
     )
 
@@ -109,14 +157,23 @@ def write_script(blocks: list[Block], st: Settings, gem: Optional[Gemini], job: 
     narr = [b for b in blocks if b.role == "main"]
     done: dict[int, str] = {}
     if gem:
-        # Giảm kích thước lô xuống 12 khối để Gemini/Ollama xử lý nhanh, không bị nghẽn token hay timeout
+        job.progress(0.05, "AI đang đọc và tóm tắt cốt truyện…")
+        global_summary = _summarize_plot(narr, st, gem, job)
+
+        # Giảm kích thước lô xuống 12 khối để Gemini/Ollama xử lý nhanh, nhẹ VRAM
         CH = 12
         prev: list[str] = []
         for i in range(0, len(narr), CH):
             job.check()
             part = narr[i:i + CH]
             try:
-                raw_res = gem.generate([{"text": _prompt(part, st, prev, i == 0, i + CH >= len(narr))}])
+                prompt_str = _prompt(
+                    part, st, prev,
+                    first=(i == 0),
+                    last=(i + CH >= len(narr)),
+                    global_summary=global_summary,
+                )
+                raw_res = gem.generate([{"text": prompt_str}])
                 arr = parse_json(raw_res)
                 if isinstance(arr, dict):
                     arr = arr.get("items") or next(iter(arr.values()))
@@ -128,7 +185,7 @@ def write_script(blocks: list[Block], st: Settings, gem: Optional[Gemini], job: 
                 job.log(f"Lô {i // CH + 1} viết kịch bản lỗi: {ex} → dùng kịch bản dự phòng cho lô này.")
 
             prev = [done[b.id] for b in part if b.id in done] or prev
-            job.progress(0.1 + 0.85 * min(1.0, (i + CH) / len(narr)), "AI viết kịch bản…")
+            job.progress(0.15 + 0.80 * min(1.0, (i + CH) / len(narr)), "AI viết kịch bản…")
     else:
         job.log("Chưa có cấu hình AI → dùng kịch bản dự phòng (bạn nên chỉnh tay).")
 
