@@ -11,7 +11,7 @@ from .analyze import Scene, Timeline
 from .config import Settings
 from .transcribe import Line
 
-EDGE = 0.12            # co vào trong ranh giới cảnh để không dính nhịp cắt
+EDGE = 0.08            # co vào trong ranh giới cảnh để không dính nhịp cắt
 OUTRO_LEN = 1.4
 
 
@@ -28,6 +28,7 @@ class Shot:
     must: bool = False                              # chứa câu thoại nút thắt
     role: str = "main"                              # main | outro
     caption: str = ""
+    caption_ai: bool = False                        # True = do AI nhìn ảnh mô tả (sự thật); False = suy luận
 
     @property
     def dur(self) -> float:
@@ -155,6 +156,40 @@ def _overlaps(sel_by_scene: dict, c: Shot, gap: float = 0.3) -> bool:
     return False
 
 
+SNAP_MAX = 1.2          # giây: tối đa kéo dài/lùi một đầu shot để khớp ranh giới câu thoại
+
+
+def snap_shots(shots: list[Shot], scenes: list[Scene], lines: list[Line], st: Settings) -> list[Shot]:
+    """Khớp đầu/cuối shot với ranh giới câu thoại: không cắt ngang giữa câu, và KHÔNG BAO GIỜ vượt ranh giới cảnh.
+    Shot nút thắt đã được neo trọn câu nên giữ nguyên."""
+    idx = LineIndex(lines)
+    bounds = {sc.id: (sc.start + EDGE, sc.end - EDGE) for sc in scenes}
+    for sh in shots:
+        if sh.must or sh.role != "main" or sh.scene_id not in bounds:
+            continue
+        lo, hi = bounds[sh.scene_id]
+        for l in idx.within(sh.start, sh.end):
+            if l.start < sh.start - 0.05 < l.end - 0.25:              # đầu shot rơi giữa câu
+                if sh.start - l.start <= SNAP_MAX and l.start >= lo:
+                    sh.start = l.start - 0.05 if l.start - 0.05 >= lo else l.start
+                elif l.end + 0.05 < sh.end - st.shot_min * 0.8:
+                    sh.start = l.end + 0.05
+            if l.start < sh.end - 0.05 < l.end - 0.25:                # cuối shot rơi giữa câu
+                if l.end - sh.end <= SNAP_MAX and l.end + 0.12 <= hi:
+                    sh.end = l.end + 0.12
+                elif l.start - 0.05 > sh.start + st.shot_min * 0.8:
+                    sh.end = l.start - 0.05
+        sh.start, sh.end = round(max(lo, sh.start), 2), round(min(hi, sh.end), 2)
+    out: list[Shot] = []
+    for sh in sorted(shots, key=lambda x: x.start):                    # gỡ chồng lấn do kéo dài
+        prev = out[-1] if out else None
+        if prev and prev.scene_id == sh.scene_id and sh.start < prev.end + 0.05:
+            sh.start = round(prev.end + 0.05, 2)
+        if sh.end - sh.start >= 1.0:
+            out.append(sh)
+    return out
+
+
 def plan_cut(scenes: list[Scene], tl: Timeline, lines: list[Line], st: Settings, log=print) -> list[Shot]:
     cands = build_candidates(scenes, tl, lines, st)
     if not cands:
@@ -225,6 +260,7 @@ def plan_cut(scenes: list[Scene], tl: Timeline, lines: list[Line], st: Settings,
         sel_scene[drop.scene_id].remove(drop)
 
     selected.sort(key=lambda s: s.start)
+    selected = snap_shots(selected, scenes, lines, st)
     log(f"Chọn {len(selected)} shot · {total():.0f}s (mục tiêu {main_target:.0f}s) · "
         f"{sum(1 for s in selected if s.must)} shot giữ vì thoại nút thắt")
 

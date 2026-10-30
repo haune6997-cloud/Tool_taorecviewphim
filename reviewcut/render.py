@@ -265,4 +265,114 @@ def render_all(video: str, blocks: list[Block], st: Settings, workdir: str, out_
             done += 1
             job.progress(0.05 + 0.60 * done / n_all, f"Dựng shot {done}/{n_all}")
 
-    # Chuyển đổi nhanh
+    # 2) ghép toàn bộ shot (cùng codec/thông số nên copy được, không mã hoá lại)
+    job.check()
+    job.progress(0.66, "Ghép các shot…")
+    main_mp4 = str(wd / "main_concat.mp4")
+    _concat(segs, main_mp4, wd / "concat_list.txt", job)
+
+    # 3) track giọng đọc: mỗi khối được đệm im lặng cho đủ độ dài khối → ghép thành 1 track khớp hình
+    job.progress(0.72, "Dựng track giọng đọc…")
+    voice_wav = _build_voice_track(timings, voice_files, wd, job)
+
+    # 4) phụ đề (ASS để đốt vào hình). SRT chỉ xuất khi người dùng bật (mặc định: kết quả chỉ là 1 file video)
+    ass_text, cues = build_ass(timings, st)
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if getattr(st, "export_srt", False):
+        write_srt(cues, str(out.with_suffix(".srt")))
+    burn = False
+    if st.subtitles and cues:
+        if has_filter("ass"):
+            (wd / "review.ass").write_text(ass_text, encoding="utf-8")
+            burn = True
+        else:
+            job.log("⚠ ffmpeg không có libass → không đốt được phụ đề lên hình.")
+
+    # 5) trộn âm thanh + (tuỳ chọn) đốt phụ đề → ghi ra file tạm rồi đổi tên (không để lại file dở nếu lỗi/huỷ)
+    job.progress(0.80, "Trộn âm thanh & xuất file…")
+    music = pick_music(st.music_path, seed=len(blocks))
+    cmd = [ff, "-y", "-v", "error", "-i", main_mp4, "-i", voice_wav]
+    if music:
+        cmd += ["-stream_loop", "-1", "-i", music]
+    fc = [f"[0:a]volume={st.orig_volume:.3f},aresample=48000,aformat=channel_layouts=stereo[o]"]
+    if music:
+        fc += ["[1:a]asplit=2[vo][vs]",
+               f"[2:a]volume={st.music_volume:.3f},aresample=48000,aformat=channel_layouts=stereo[m]",
+               "[m][vs]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=400[md]",
+               "[o][vo][md]amix=inputs=3:duration=first:dropout_transition=0:normalize=0,alimiter=limit=0.95[a]"]
+    else:
+        fc += ["[o][1:a]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,alimiter=limit=0.95[a]"]
+    if burn:
+        fc.append("[0:v]ass=review.ass[v]")
+        vmap, venc = "[v]", _enc(st, 18)
+    else:
+        vmap, venc = "0:v", ["-c:v", "copy"]
+    tmp_out = str(out.with_name(out.stem + ".part.mp4"))
+    cmd += ["-filter_complex", ";".join(fc), "-map", vmap, "-map", "[a]", "-shortest"]
+    cmd += venc + ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-movflags", "+faststart", tmp_out]
+    try:
+        run(cmd, job, cwd=str(wd))          # chạy trong workdir để tên file .ass không cần escape ký tự ổ đĩa (C:\\)
+        if not Path(tmp_out).exists() or Path(tmp_out).stat().st_size < 1000:
+            raise RuntimeError("ffmpeg chạy xong nhưng không tạo ra file video đầu ra.")
+        Path(tmp_out).replace(out)
+    finally:
+        Path(tmp_out).unlink(missing_ok=True)
+    job.progress(1.0, "Xong bước 3")
+    return str(out)
+
+
+def cleanup_work(workdir: str) -> None:
+    """Xoá file tạm nặng sau khi xuất xong (cảnh đã dựng, track giọng, file ghép). Giữ kế hoạch, thoại, mô tả, cache giọng."""
+    import shutil
+    wd = Path(workdir)
+    for name in ("segments", "voice_pieces"):
+        shutil.rmtree(wd / name, ignore_errors=True)
+    for name in ("main_concat.mp4", "voice_track.wav", "concat_list.txt", "voice_list.txt", "review.ass"):
+        (wd / name).unlink(missing_ok=True)
+
+
+def _concat(files: list[str], out: str, list_file: Path, job: Job) -> None:
+    def esc(p: str) -> str:
+        return p.replace("\\", "/").replace("'", "'\\''")
+    list_file.write_text("".join(f"file '{esc(str(Path(f).resolve()))}'\n" for f in files), encoding="utf-8")
+    run([find_tool("ffmpeg"), "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(list_file),
+         "-c", "copy", out], job)
+
+
+def _build_voice_track(timings: list[Timing], voice_files: dict[int, str], wd: Path, job: Job) -> str:
+    """Mỗi khối → 1 file wav dài đúng bằng khối (giọng vào sau LEAD giây, phần còn lại im lặng), rồi nối lại."""
+    ff = find_tool("ffmpeg")
+    pd = wd / "voice_pieces"
+    pd.mkdir(exist_ok=True)
+    pieces: list[str] = []
+    for t in timings:
+        b = t.block
+        f = voice_files.get(b.id)
+        h = hashlib.sha1(f"{f}|{t.atempo:.4f}|{t.total:.3f}".encode()).hexdigest()[:12]
+        out = str(pd / f"v_{h}.wav")
+        if not Path(out).exists():
+            job.check()
+            fmt = "aresample=48000,aformat=channel_layouts=stereo"
+            if f and Path(f).exists() and t.voice_dur > 0:
+                af = f"atempo={t.atempo:.4f},adelay={int(LEAD * 1000)}:all=1,apad=whole_dur={t.total:.3f},{fmt}"
+                run([ff, "-y", "-v", "error", "-i", f, "-af", af, "-t", f"{t.total:.3f}", out], job)
+            else:
+                run([ff, "-y", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+                     "-t", f"{t.total:.3f}", out], job)
+        pieces.append(out)
+    final = str(wd / "voice_track.wav")
+    _concat(pieces, final, wd / "voice_list.txt", job)
+    return final
+
+
+# ------------------------------------------------------------------ xem trước 1 khung hình (có/không hiệu ứng)
+def render_preview_frame(video: str, t: float, st: Settings, out_png: str, job: Optional[Job] = None) -> str:
+    """Xuất 1 khung PNG đúng như sẽ thấy trong video: khung hình, cắt dải phụ đề, chỉnh màu, vignette, grain, zoom."""
+    st2 = Settings(**{**st.__dict__})
+    st2.zoom = False                       # zoom chạy theo thời gian; ảnh tĩnh lấy khung đầu (không phóng)
+    st2.fps = 30
+    vf = video_filter(st2, 2.0, 1.0, 0.0, 1)
+    run([find_tool("ffmpeg"), "-y", "-v", "error", "-ss", f"{max(0.0, t):.3f}", "-i", video, "-filter_complex", vf,
+         "-map", "[v]", "-frames:v", "1", out_png], job)
+    return out_png

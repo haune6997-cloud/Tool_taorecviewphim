@@ -8,18 +8,40 @@ from pathlib import Path
 from typing import Optional
 
 from . import analyze, plot, render, tts
-from .config import Settings
-from .gemini import Gemini
+from .config import Settings, env_key
+from .ai import AIClient
 from .media import Job, extract_audio, fmt_time, probe
 from .select import Block, Shot, blocks_from_dict, make_blocks, plan_cut
 from .transcribe import Line, load_subtitle, transcribe
 from .vision import caption_shots
 
 
+def safe_filename(name: str, default: str = "review") -> str:
+    """Tên file hợp lệ trên Windows/macOS/Linux (bỏ ký tự cấm, dấu chấm/cách ở cuối, tên dành riêng)."""
+    n = re.sub(r'[\\/*?:"<>|\x00-\x1f]', "", name or "").strip().strip(".")
+    n = re.sub(r"\s+", " ", n)
+    if n.lower().endswith(".mp4"):
+        n = n[:-4].rstrip()
+    if n.upper() in {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}:
+        n += "_"
+    return n[:120] or default
+
+
+def unique_path(p: Path) -> Path:
+    """Không ghi đè file có sẵn: thêm ' (2)', ' (3)'…"""
+    if not p.exists():
+        return p
+    for i in range(2, 1000):
+        q = p.with_name(f"{p.stem} ({i}){p.suffix}")
+        if not q.exists():
+            return q
+    return p
+
+
 class Project:
     """Trạng thái một lần làm phim, lưu JSON trong workdir để chạy tiếp / sửa tay giữa các bước."""
 
-    def __init__(self, st: Settings):
+    def __init__(self, st: Settings, asker=None):
         if not st.video or not Path(st.video).is_file():
             raise RuntimeError("Chưa chọn video đầu vào.")
         self.st = st
@@ -32,6 +54,8 @@ class Project:
         self.lines: list[Line] = []
         self.blocks: list[Block] = []
         self.duration = 0.0
+        self.asker = asker                      # hàm hỏi người dùng khi AI đám mây lỗi (do GUI/CLI cung cấp)
+        self._ai: Optional[AIClient] = None
 
     # ------------------------------------------------------------ lưu / nạp
     @property
@@ -55,8 +79,29 @@ class Project:
         self.blocks = blocks_from_dict(d["blocks"])
         return True
 
-    def gemini(self) -> Optional[Gemini]:
-        return Gemini(self.st.gemini_key, self.st.gemini_model) if self.st.gemini_key.strip() else None
+    def ai_client(self, stage: str = "", job: Optional[Job] = None) -> AIClient:
+        """Một client DUY NHẤT cho cả dự án; mỗi bước gọi begin_stage → quyết định Ollama/dự phòng chỉ hỏi 1 lần mỗi bước."""
+        st = self.st
+        gk, mk = st.groq_key.strip() or env_key("GROQ_API_KEY"), st.gemini_key.strip() or env_key("GEMINI_API_KEY", "GOOGLE_API_KEY")
+        policy = st.ai_fallback
+        if not gk and not mk and policy == "ask":
+            policy = "offline"                  # chưa nhập key nào: không làm phiền; muốn dùng Ollama hãy chọn 'Tự dùng Ollama'
+        if self._ai is None:
+            self._ai = AIClient(gk, st.groq_model, st.groq_vision_model, mk, st.gemini_model, st.ollama_model, st.ollama_url,
+                                st.ollama_vision_model, policy, self.asker, groq_rpm=st.groq_rpm,
+                                ollama_timeout=st.ollama_timeout)
+        if stage:
+            self._ai.begin_stage(stage, job)
+        return self._ai
+
+    gemini = ai_client                          # tên cũ
+
+    def output_path(self) -> Path:
+        """Đường dẫn file kết quả: <thư mục xuất>/<tên file>.mp4 (không ghi đè file có sẵn)."""
+        st = self.st
+        name = safe_filename(st.output_name or st.title, default=f"{safe_filename(Path(st.video).stem)}_review")
+        d = Path(st.output_dir) if st.output_dir else (Path(st.workdir) if st.workdir else Path(st.video).parent)
+        return unique_path(d / f"{name}.mp4")
 
     # ------------------------------------------------------------ giai đoạn 1
     def stage1_analyze_and_cut(self, job: Job) -> list[Block]:
@@ -132,23 +177,11 @@ class Project:
                 items.append((b.text, f))
         tts.synth_many(items, st, job)
         job.check()
-
-        # 1. Xác định thư mục lưu: Ưu tiên ô "Thư mục lưu" trên giao diện (st.workdir)
-        target_dir = Path(st.workdir) if st.workdir else Path(st.video).parent
-        target_dir.mkdir(parents=True, exist_ok=True)
-
-        # 2. Xác định tên file: Ưu tiên ô "Tên phim" trên giao diện (st.title)
-        raw_title = getattr(st, "title", "").strip()
-        if raw_title:
-            safe_name = re.sub(r'[\\/*?:"<>|]', "", raw_title)
-            final_filename = f"{safe_name}.mp4"
-        else:
-            final_filename = f"{Path(st.video).stem}_review.mp4"
-
-        # Xuất thẳng ra file hoàn chỉnh tại thư mục đích, không tạo file tạm, không bật popup
-        out = out_path or str(target_dir / final_filename)
+        out = out_path or str(self.output_path())
         render.render_all(st.video, self.blocks, st, str(self.wd), out, job, files)
-        job.log(f"✔ Xuất: {out}")
+        if st.cleanup_temp:
+            render.cleanup_work(str(self.wd))
+        job.log(f"✔ Đã xuất video: {out}")
         return out
 
     def run_all(self, job: Job) -> str:

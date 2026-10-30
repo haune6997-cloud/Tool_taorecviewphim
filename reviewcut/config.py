@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
@@ -83,6 +84,14 @@ SOFTEN = {
 }
 
 
+# Cụm máy móc hay bị lặp (do mô tả dự phòng / mô hình nhỏ) – bị lọc khỏi lời bình và bắt viết lại
+BANNED_PHRASES = [
+    "cảnh hành động dồn dập", "máy quay chuyển động mạnh", "diễn biến tiếp nối của câu chuyện",
+    "cận mặt nhân vật", "ánh nhìn đầy suy tư", "không gian tối, bầu không khí căng thẳng",
+    "hai nhân vật đối thoại với nhau", "cảnh này cho thấy", "máy quay", "đoạn video", "thoại gốc",
+]
+
+
 @dataclass
 class Settings:
     # đầu vào
@@ -91,8 +100,18 @@ class Settings:
     srt_path: str = ""                 # (tuỳ chọn) phụ đề sẵn có – bỏ qua Whisper
     title: str = ""                    # tên phim (giúp AI viết kịch bản)
     # API
-    gemini_key: str = ""
-    gemini_model: str = "gemini-1.5-flash"
+    groq_key: str = ""                 # trống → biến môi trường GROQ_API_KEY
+    groq_model: str = "llama-3.3-70b-versatile"
+    groq_vision_model: str = "meta-llama/llama-4-scout-17b-16e-instruct"
+    groq_rpm: int = 25                 # Groq free: 30 request/phút → mặc định 25 để chừa biên an toàn
+    gemini_key: str = ""               # trống → biến môi trường GEMINI_API_KEY / GOOGLE_API_KEY
+    gemini_model: str = "gemini-flash-latest"   # alias luôn trỏ Flash mới nhất (1.5/2.0 đã bị Google tắt)
+    # khi mọi AI đám mây lỗi: quyết định 1 lần cho mỗi bước
+    ai_fallback: str = "ask"           # ask = hỏi | ollama = tự chuyển Ollama | offline = tự dùng kịch bản dự phòng
+    ollama_model: str = "qwen2.5:7b"
+    ollama_vision_model: str = ""      # vd qwen2.5vl:7b, llava; trống = mô tả ảnh dùng bản dự phòng
+    ollama_url: str = "http://localhost:11434"
+    ollama_timeout: int = 300
     # Whisper
     whisper_model: str = "small"       # tiny/base/small/medium/large-v3
     whisper_lang: str = "auto"
@@ -133,6 +152,11 @@ class Settings:
     sub_size: float = 0.052            # tỉ lệ theo chiều cao khung
     encoder: str = "libx264"           # libx264 | h264_nvenc
     fps: int = 30
+    # kết quả
+    output_name: str = ""              # tên file kết quả (không cần .mp4). Trống = <tên phim>_review
+    output_dir: str = ""               # thư mục xuất. Trống = thư mục lưu / thư mục chứa video
+    cleanup_temp: bool = True          # xoá file tạm (cảnh đã dựng, track giọng…) sau khi xuất xong
+    export_srt: bool = False           # xuất thêm file .srt (mặc định chỉ xuất video)
 
     def genre_cfg(self) -> dict:
         return GENRES.get(self.genre, GENRES[DEFAULT_GENRE])
@@ -147,18 +171,49 @@ class Settings:
         return max(30.0, self.target_minutes * 60.0)
 
 
+def env_key(*names: str) -> str:
+    for n in names:
+        v = os.environ.get(n, "").strip()
+        if v:
+            return v
+    return ""
+
+
+RETIRED_GEMINI = ("gemini-1.0", "gemini-1.5", "gemini-2.0", "gemini-pro")
+
+
 def load_settings() -> Settings:
     try:
         raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
     except Exception:
-        return Settings()
+        raw = {}
     names = {f.name for f in fields(Settings)}
-    return Settings(**{k: v for k, v in raw.items() if k in names})
+    st = Settings(**{k: v for k, v in raw.items() if k in names})
+    # --- di trú cấu hình cũ: bản trước nhét key Groq vào ô Gemini / dùng "ollama" làm key giả
+    if st.gemini_key.startswith("gsk_"):
+        st.groq_key = st.groq_key or st.gemini_key
+        st.gemini_key = ""
+    if st.gemini_key.strip().lower() == "ollama":
+        st.gemini_key = ""
+    if not st.gemini_model.strip() or st.gemini_model.strip().startswith(RETIRED_GEMINI) \
+            or st.gemini_model.strip() == "llama-3.3-70b-versatile":
+        st.gemini_model = Settings().gemini_model
+    st.groq_key = st.groq_key.strip() or env_key("GROQ_API_KEY")
+    st.gemini_key = st.gemini_key.strip() or env_key("GEMINI_API_KEY", "GOOGLE_API_KEY")
+    st.groq_rpm = max(1, min(30, int(st.groq_rpm or 25)))
+    if st.ai_fallback not in ("ask", "ollama", "offline"):
+        st.ai_fallback = "ask"
+    return st
 
 
 def save_settings(s: Settings, keep_keys: bool = True) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     d = asdict(s)
+    d.pop("video", None)               # đường dẫn video/tên file kết quả theo từng lần làm, không lưu thành mặc định
     if not keep_keys:
-        d["gemini_key"] = ""
+        d["groq_key"] = d["gemini_key"] = ""
     CONFIG_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        os.chmod(CONFIG_FILE, 0o600)   # file có API key: chỉ chủ máy đọc được (Linux/macOS)
+    except OSError:
+        pass

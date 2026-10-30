@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 *_reviewcut/
 .pytest_cache/
+.idea/
+.vscode/
+*.part
+*.part.mp4
+.env

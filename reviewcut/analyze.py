@@ -1,7 +1,9 @@
 """Phân tích video: cắt cảnh, motion score, khuôn mặt cận cảnh, đỉnh âm thanh, cảnh đen/credits."""
 from __future__ import annotations
 
+import re
 import subprocess
+import threading
 import wave
 from dataclasses import asdict, dataclass, field
 from typing import Optional
@@ -93,6 +95,90 @@ def audio_energy(wav_path: str, hop: float = 1.0 / SAMPLE_FPS) -> np.ndarray:
     return np.asarray(out, dtype=np.float32)
 
 
+MIN_SCENE_GAP = 0.5      # giây: hai điểm cắt gần hơn mức này coi là một (chớp sáng, nổ)
+
+
+class SceneCutScanner:
+    """Chạy ffmpeg bộ lọc `scene` song song với luồng phân tích chính → điểm cắt CHÍNH XÁC tới từng khung hình
+    (bản cũ chỉ lấy mẫu 4 khung/giây nên lệch tới 0.25 s và làm shot dính vài khung của cảnh trước/sau)."""
+
+    def __init__(self, video: str):
+        self.times: list[float] = []
+        self.scores: list[float] = []
+        self.ok = False
+        cmd = [find_tool("ffmpeg"), "-v", "error", "-i", video, "-an", "-vf",
+               "scale=160:90:flags=fast_bilinear,select='gte(scene,0)',metadata=print:key=lavfi.scene_score:file=-",
+               "-f", "null", "-"]
+        try:
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
+        except OSError:
+            self.proc = None
+            return
+        self.th = threading.Thread(target=self._read, daemon=True)
+        self.th.start()
+
+    def _read(self) -> None:
+        t = None
+        for raw in self.proc.stdout:                     # type: ignore[union-attr]
+            line = raw.decode("utf-8", "replace")
+            m = re.search(r"pts_time:([\d.]+)", line)
+            if m:
+                t = float(m.group(1))
+                continue
+            m = re.search(r"lavfi\.scene_score=([\d.eE+-]+)", line)
+            if m and t is not None:
+                self.times.append(t)
+                self.scores.append(float(m.group(1)))
+                t = None
+
+    def result(self, min_gap: float = MIN_SCENE_GAP) -> Optional[list[float]]:
+        """Danh sách thời điểm cắt (giây) hoặc None nếu bộ lọc không chạy được."""
+        if self.proc is None:
+            return None
+        try:
+            self.th.join(timeout=None)
+            self.proc.wait(timeout=30)
+        except Exception:                                # noqa: BLE001
+            self.proc.kill()
+        if len(self.times) < 8:
+            return None
+        sc = np.array(self.scores)
+        thr = float(min(0.45, max(0.28, sc.mean() + 8 * sc.std())))
+        cuts: list[tuple[float, float]] = []
+        for t, v in zip(self.times, self.scores):
+            if v < thr or t < 0.3:
+                continue
+            if cuts and t - cuts[-1][0] < min_gap:        # quá gần → giữ điểm cắt mạnh hơn
+                if v > cuts[-1][1]:
+                    cuts[-1] = (t, v)
+                continue
+            cuts.append((t, v))
+        self.thr = thr
+        return [t for t, _ in cuts]
+
+    def stop(self) -> None:
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.kill()
+
+
+def refine_cut(video: str, t_lo: float, t_hi: float, fps: float) -> Optional[float]:
+    """Tìm khung có thay đổi lớn nhất trong [t_lo, t_hi] (đọc đủ số khung/giây) → thời điểm cắt chính xác."""
+    w, h = 160, 90
+    cmd = [find_tool("ffmpeg"), "-v", "error", "-ss", f"{max(0.0, t_lo):.3f}", "-i", video, "-t", f"{t_hi - t_lo:.3f}",
+           "-an", "-vf", f"scale={w}:{h}:flags=fast_bilinear,format=gray", "-f", "rawvideo", "-"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, timeout=60, creationflags=NO_WINDOW).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    nfr = len(out) // (w * h)
+    if nfr < 3:
+        return None
+    arr = np.frombuffer(out[: nfr * w * h], dtype=np.uint8).reshape(nfr, h, w).astype(np.int16)
+    d = np.abs(np.diff(arr, axis=0)).mean(axis=(1, 2))
+    i = int(d.argmax())
+    return max(0.0, t_lo) + (i + 1) / max(1.0, fps) if d[i] >= 8.0 else None
+
+
 def _face_detector():
     path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
     det = cv2.CascadeClassifier(path)
@@ -119,6 +205,7 @@ def analyze_video(video: str, workdir: str, job: Job, skip_head: float = 0.0, sk
     # ---- đọc khung hình qua ffmpeg (nhanh hơn seek bằng OpenCV)
     cmd = [find_tool("ffmpeg"), "-v", "error", "-i", video, "-an", "-vf",
            f"fps={SAMPLE_FPS},scale={FW}:{FH}:flags=fast_bilinear", "-pix_fmt", "bgr24", "-f", "rawvideo", "-"]
+    scanner = SceneCutScanner(video)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=NO_WINDOW)
     fsize = FW * FH * 3
     det = _face_detector()
@@ -156,29 +243,51 @@ def analyze_video(video: str, workdir: str, job: Job, skip_head: float = 0.0, sk
                 fs = facesz[-1] * 0.9           # giữ gần đúng ở mẫu bỏ qua
             facesz.append(fs)
             prev_gray, prev_hist, n = gray, h, n + 1
+    except BaseException:
+        scanner.stop()
+        raise
     finally:
         proc.stdout.close()
         proc.kill()
         proc.wait()
     if n < 4:
+        scanner.stop()
         raise RuntimeError("Không đọc được khung hình nào từ video.")
 
     hists, diffs = np.array(hists), np.array(diffs)
     bright, darkf, brightf, facesz = map(np.array, (bright, darkf, brightf, facesz))
     energy = energy[:n] if len(energy) >= n else np.pad(energy, (0, n - len(energy)), constant_values=energy.min() if len(energy) else -80)
 
-    # ---- phát hiện điểm cắt cảnh
+    # ---- phát hiện điểm cắt cảnh: (1) bộ lọc scene của ffmpeg (chính xác từng khung)
+    #      (2) histogram 4 fps; điểm cắt chỉ (2) thấy được sẽ được AFFINE lại tới từng khung → hợp nhất
+    end_t = n / SAMPLE_FPS
+    exact = scanner.result() or []
     thr = max(0.30, float(hists.mean() + 3.5 * hists.std()))
-    cuts = [0]
+    hist_cuts, last_i = [], 0
     for i in range(1, n):
-        if hists[i] > thr and (i - cuts[-1]) >= SAMPLE_FPS * 1.0:
-            cuts.append(i)
-    cuts.append(n)
-    cut_idx = set(cuts[1:-1])
+        if hists[i] > thr and (i - last_i) >= max(2, int(SAMPLE_FPS * MIN_SCENE_GAP)):
+            hist_cuts.append(i)
+            last_i = i
+    extra = []
+    for i in hist_cuts:
+        lo, hi = (i - 1) / SAMPLE_FPS, i / SAMPLE_FPS
+        if any(lo - 0.3 <= t <= hi + 0.3 for t in exact):
+            continue                                    # đã có điểm cắt chính xác gần đó
+        t = refine_cut(video, lo - 0.08, hi + 0.08, info["fps"])
+        extra.append(t if t is not None else hi)
+    merged: list[float] = []
+    for t in sorted(exact + extra):
+        if 0.5 < t < end_t - 0.3 and (not merged or t - merged[-1] >= MIN_SCENE_GAP):
+            merged.append(t)
+    cut_times = [0.0] + merged + [end_t]
+    job.log(f"Điểm cắt cảnh: {len(merged)} (ffmpeg scene {len(exact)} + histogram-affine {len(extra)}).")
+    cut_idx = {min(n - 1, int(t * SAMPLE_FPS)) for t in cut_times[1:-1]}
     # chuyển động: bỏ mẫu nằm ngay tại điểm cắt (nhảy cảnh ≠ chuyển động)
     motion = diffs.copy()
     for i in cut_idx:
-        motion[i] = motion[i - 1] if i > 0 else 0.0
+        for j in (i, i + 1):
+            if 0 < j < n:
+                motion[j] = motion[i - 1]
     motion_rank = rank_norm(motion)
     audio_rank = rank_norm(energy)
 
@@ -197,13 +306,14 @@ def analyze_video(video: str, workdir: str, job: Job, skip_head: float = 0.0, sk
 
     head, tail_t = skip_head, dur - skip_tail
     scenes: list[Scene] = []
-    for k in range(len(cuts) - 1):
-        a, b = cuts[k], cuts[k + 1]
-        t0, t1 = a / SAMPLE_FPS, b / SAMPLE_FPS
+    for k in range(len(cut_times) - 1):
+        t0, t1 = cut_times[k], cut_times[k + 1]
+        a = min(n - 1, int(round(t0 * SAMPLE_FPS)))
+        b = min(n, max(a + 1, int(round(t1 * SAMPLE_FPS))))
         sl = slice(a, b)
         m = motion[sl]
         fsz = facesz[sl]
-        sc = Scene(id=len(scenes), start=round(t0, 2), end=round(t1, 2),
+        sc = Scene(id=len(scenes), start=round(t0, 3), end=round(t1, 3),
                    motion_raw=float(np.percentile(m, 75)) if len(m) else 0.0,
                    motion=float(np.percentile(motion_rank[sl], 75)) if len(m) else 0.0,
                    face=float((fsz > 0.035).mean()) if len(fsz) else 0.0,

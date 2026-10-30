@@ -1,6 +1,8 @@
-faster-whisper>=1.0      # Whisper nghe thoại + timestamp (có thể dùng openai-whisper thay thế)
-edge-tts>=6.1            # giọng đọc tiếng Việt
+faster-whisper>=1.0      # Whisper nghe thoại + timestamp
+edge-tts>=7.0            # giọng đọc tiếng Việt (>=7: sửa lỗi 403 "Invalid response status" do mã Sec-MS-GEC)
 opencv-python-headless>=4.8
 numpy>=1.24
 requests>=2.31
-# kiểm thử:  pip install pytest
+# tuỳ chọn:
+#   gTTS>=2.5             # giọng dự phòng khi Edge TTS bị chặn mạng (pip install gTTS)
+#   pytest                # chạy kiểm thử

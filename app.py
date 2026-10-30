@@ -1,27 +1,27 @@
 """ReviewCut – giao diện: cắt cảnh trước (Whisper + Vision + motion/mặt) → viết kịch bản sau → lồng tiếng & dựng."""
 from __future__ import annotations
 
-# --- VÁ LỖI TỰ ĐỘNG CHO AV / METADATA_ERRORS ---
-import av
-_orig_av_open = av.open
-def _safe_av_open(*args, **kwargs):
-    kwargs.pop('metadata_errors', None)
-    return _orig_av_open(*args, **kwargs)
-av.open = _safe_av_open
-# ---------------------------------------------
-
 import os
 import sys
 
-# Tự động nạp thư viện CUDA cuBLAS vào PATH
-cuda_path = os.path.join(sys.prefix, "Lib", "site-packages", "nvidia", "cublas", "bin")
-if os.path.exists(cuda_path):
-    os.add_dll_directory(cuda_path)
-    os.environ["PATH"] = cuda_path + os.pathsep + os.environ["PATH"]
+try:                                        # vá tương thích PyAV/faster-whisper (chỉ khi đã cài av)
+    import av
+    _orig_av_open = av.open
 
-import json
+    def _safe_av_open(*args, **kwargs):
+        kwargs.pop("metadata_errors", None)
+        return _orig_av_open(*args, **kwargs)
+    av.open = _safe_av_open
+except Exception:                           # noqa: BLE001
+    pass
+
+if sys.platform.startswith("win") and hasattr(os, "add_dll_directory"):     # nạp cuBLAS (Windows + GPU NVIDIA)
+    _cuda = os.path.join(sys.prefix, "Lib", "site-packages", "nvidia", "cublas", "bin")
+    if os.path.exists(_cuda):
+        os.add_dll_directory(_cuda)
+        os.environ["PATH"] = _cuda + os.pathsep + os.environ.get("PATH", "")
+
 import queue
-import re
 import shutil
 import subprocess
 import tempfile
@@ -35,6 +35,7 @@ from reviewcut.config import (ASPECTS, GENRES, GRADES, VOICES, Settings, load_se
 from reviewcut.media import Cancelled, Job, find_tool, fmt_time
 from reviewcut.pipeline import Project
 from reviewcut.script import max_words
+from reviewcut import preview as pv
 
 BG, CARD, INK, MUTED = "#f2f4f7", "#ffffff", "#1f2937", "#6b7280"
 TEAL, ORANGE, BLUE, RED, GREEN = "#0f8b8d", "#e8590c", "#1d6fb8", "#d64545", "#2f9e44"
@@ -51,12 +52,14 @@ class App(tk.Tk):
         self.project: Project | None = None
         self.q: queue.Queue = queue.Queue()
         self.job: Job | None = None
+        self.shot_rows: dict = {}
         self.busy = False
         self.play_proc: subprocess.Popen | None = None
         self._style()
         self._vars()
         self._build()
         self.after(100, self._poll)
+        self.v["video"].trace_add("write", lambda *a: self.after(400, self._on_video_changed))
         self.protocol("WM_DELETE_WINDOW", self._close)
 
     # ------------------------------------------------------------ giao diện
@@ -77,22 +80,19 @@ class App(tk.Tk):
         s.configure("Treeview", rowheight=24, background="white", fieldbackground="white")
         s.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
 
+    FALLBACK_LABELS = {"ask": "Hỏi tôi (1 lần cho mỗi bước)", "ollama": "Tự dùng Ollama", "offline": "Tự dùng kịch bản dự phòng"}
+
     def _vars(self):
         st = self.st
-        cfg_path = Path.home() / ".reviewcut" / "config.json"
-        extra = {}
-        if cfg_path.is_file():
-            try:
-                extra = json.loads(cfg_path.read_text(encoding="utf-8"))
-            except Exception:
-                pass
-
         V = lambda cls, v: cls(value=v)
         self.v = {
-            "groq_key": V(tk.StringVar, extra.get("groq_key", "")),
-            "groq_model": V(tk.StringVar, extra.get("groq_model", "llama-3.3-70b-versatile")),
-            "gemini_key": V(tk.StringVar, st.gemini_key),
-            "gemini_model": V(tk.StringVar, st.gemini_model or "gemini-1.5-flash"),
+            "groq_key": V(tk.StringVar, st.groq_key), "groq_model": V(tk.StringVar, st.groq_model),
+            "groq_vision_model": V(tk.StringVar, st.groq_vision_model), "groq_rpm": V(tk.IntVar, st.groq_rpm),
+            "gemini_key": V(tk.StringVar, st.gemini_key), "gemini_model": V(tk.StringVar, st.gemini_model),
+            "ai_fallback": V(tk.StringVar, self.FALLBACK_LABELS.get(st.ai_fallback, self.FALLBACK_LABELS["ask"])),
+            "ollama_model": V(tk.StringVar, st.ollama_model), "ollama_vision_model": V(tk.StringVar, st.ollama_vision_model),
+            "output_name": V(tk.StringVar, st.output_name), "output_dir": V(tk.StringVar, st.output_dir),
+            "cleanup_temp": V(tk.BooleanVar, st.cleanup_temp), "export_srt": V(tk.BooleanVar, st.export_srt),
             "workdir": V(tk.StringVar, st.workdir), "title": V(tk.StringVar, st.title),
             "whisper_model": V(tk.StringVar, st.whisper_model), "whisper_lang": V(tk.StringVar, st.whisper_lang),
             "video": V(tk.StringVar, st.video), "srt_path": V(tk.StringVar, st.srt_path),
@@ -142,7 +142,12 @@ class App(tk.Tk):
         cv.configure(yscrollcommand=sb.set)
         cv.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
-        cv.bind_all("<MouseWheel>", lambda e: cv.yview_scroll(int(-e.delta / 120), "units") if self.focus_get() and "combobox" not in str(self.focus_get()).lower() else None)
+        def wheel(e):
+            if self.focus_get() and "combobox" in str(self.focus_get()).lower():
+                return
+            cv.yview_scroll(-1 if (e.num == 4 or e.delta > 0) else 1, "units")
+        for ev in ("<MouseWheel>", "<Button-4>", "<Button-5>"):      # Windows/macOS: MouseWheel · Linux: Button-4/5
+            cv.bind_all(ev, wheel)
         paned.add(left_outer, weight=2)
         right = ttk.Frame(paned)
         paned.add(right, weight=3)
@@ -165,30 +170,49 @@ class App(tk.Tk):
 
     def _left(self, p):
         v = self.v
-        f = self._card(p, "⚙ Cấu hình AI & Thư mục")
-
-        # Cấu hình Groq (Ưu tiên 1)
+        f = self._card(p, "⚙ Cấu hình AI")
         self._row(f, 0, "Groq API Key", lambda x: self._entry_btn(x, v["groq_key"], None, show="•"))
-        self._row(f, 1, "Model Groq", lambda x: ttk.Combobox(x, textvariable=v["groq_model"],
-            values=["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "qwen-qwq-32b"]))
+        self._row(f, 1, "Model Groq (chữ)", lambda x: ttk.Combobox(x, textvariable=v["groq_model"],
+            values=["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "openai/gpt-oss-20b"]))
+        self._row(f, 2, "Model Groq (ảnh)", lambda x: ttk.Combobox(x, textvariable=v["groq_vision_model"],
+            values=["meta-llama/llama-4-scout-17b-16e-instruct"]))
+        r = ttk.Frame(f)
+        ttk.Spinbox(r, from_=5, to=30, width=5, textvariable=v["groq_rpm"]).pack(side="left")
+        ttk.Label(r, text="request/phút (Groq free tối đa 30 → nên để 25)").pack(side="left", padx=6)
+        self._row(f, 3, "Giới hạn gửi Groq", lambda x: r)
+        self._row(f, 4, "Gemini Key", lambda x: self._entry_btn(x, v["gemini_key"], None, show="•"))
+        self._row(f, 5, "Model Gemini", lambda x: ttk.Entry(x, textvariable=v["gemini_model"]))
+        self._row(f, 6, "Khi AI đám mây lỗi", lambda x: ttk.Combobox(x, textvariable=v["ai_fallback"], state="readonly",
+                                                                   values=list(self.FALLBACK_LABELS.values())))
+        self._row(f, 7, "Model Ollama (chữ)", lambda x: ttk.Entry(x, textvariable=v["ollama_model"]))
+        self._row(f, 8, "Model Ollama (ảnh)", lambda x: ttk.Entry(x, textvariable=v["ollama_vision_model"]))
+        ttk.Label(f, text="✦ Thứ tự: Groq ➔ Gemini ➔ Ollama / kịch bản dự phòng. Khi cả hai AI đám mây lỗi, chương trình hỏi MỘT LẦN cho "
+                          "cả bước (không hỏi lại ở từng lô); sang bước sau mới thử đám mây lại.",
+                  style="Muted.TLabel", wraplength=470).grid(row=9, column=0, columnspan=2, sticky="w", pady=(2, 4))
+        bb = ttk.Frame(f)
+        bb.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        bb.columnconfigure((0, 1), weight=1)
+        ttk.Button(bb, text="💾 Lưu cấu hình", style="Blue.TButton", command=self._save).grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        ttk.Button(bb, text="🔌 Kiểm tra kết nối AI & giọng đọc", style="Teal.TButton", command=self._check_conn).grid(row=0, column=1, sticky="ew", padx=(3, 0))
 
-        # Cấu hình Gemini (Ưu tiên 2)
-        self._row(f, 2, "Gemini Key", lambda x: self._entry_btn(x, v["gemini_key"], None, show="•"))
-        self._row(f, 3, "Model Gemini", lambda x: ttk.Entry(x, textvariable=v["gemini_model"]))
+        f = self._card(p, "📦 Kết quả xuất")
+        self._row(f, 0, "Tên file kết quả", lambda x: ttk.Entry(x, textvariable=v["output_name"]))
+        ttk.Label(f, text="(không cần .mp4 · để trống = lấy Tên phim · không ghi đè file cũ, tự thêm “ (2)”)", style="Muted.TLabel").grid(row=1, column=1, sticky="w")
+        self._row(f, 2, "Thư mục xuất video", lambda x: self._entry_btn(x, v["output_dir"], "dir"))
+        self._row(f, 3, "Thư mục làm việc", lambda x: self._entry_btn(x, v["workdir"], "dir"))
+        self._row(f, 4, "Tên phim (cho AI)", lambda x: ttk.Entry(x, textvariable=v["title"]))
+        ttk.Checkbutton(f, text="Xoá file tạm sau khi xuất (chỉ giữ 1 file video kết quả)", variable=v["cleanup_temp"]).grid(row=5, column=0, columnspan=2, sticky="w")
+        ttk.Checkbutton(f, text="Xuất kèm file phụ đề .srt (mặc định tắt)", variable=v["export_srt"]).grid(row=6, column=0, columnspan=2, sticky="w")
+        self.lbl_out = ttk.Label(f, text="", style="Muted.TLabel", wraplength=470)
+        self.lbl_out.grid(row=7, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        for k in ("output_name", "output_dir", "title", "workdir", "video"):
+            v[k].trace_add("write", lambda *a: self._show_outpath())
 
-        # Thư mục lưu & Tên phim
-        self._row(f, 4, "Thư mục lưu", lambda x: self._entry_btn(x, v["workdir"], "dir"))
-        self._row(f, 5, "Tên phim", lambda x: ttk.Entry(x, textvariable=v["title"]))
-
-        # Whisper & Phụ đề
-        self._row(f, 6, "Whisper model", lambda x: ttk.Combobox(x, textvariable=v["whisper_model"], state="readonly",
+        f = self._card(p, "🗣 Nhận dạng thoại")
+        self._row(f, 0, "Whisper model", lambda x: ttk.Combobox(x, textvariable=v["whisper_model"], state="readonly",
                                                               values=["tiny", "base", "small", "medium", "large-v3"]))
-        self._row(f, 7, "Ngôn ngữ phim", lambda x: ttk.Combobox(x, textvariable=v["whisper_lang"],
-                                                                values=["auto", "vi", "en", "zh", "ko", "ja", "th", "fr", "es"]))
-
-        ttk.Label(f, text="✦ Thứ tự ưu tiên tự động: Groq (Số 1) ➔ Gemini (Số 2) ➔ Ollama Offline (Phao cứu sinh)",
-                  style="Muted.TLabel", wraplength=460).grid(row=8, column=0, columnspan=2, sticky="w", pady=(2, 4))
-        ttk.Button(f, text="💾 Lưu cấu hình", style="Blue.TButton", command=self._save).grid(row=9, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        self._row(f, 1, "Ngôn ngữ phim", lambda x: ttk.Combobox(x, textvariable=v["whisper_lang"],
+                                                               values=["auto", "vi", "en", "zh", "ko", "ja", "th", "fr", "es"]))
 
         f = self._card(p, "🎞 Video đầu vào & phân cảnh AI")
         self._row(f, 0, "Video gốc", lambda x: self._entry_btn(x, v["video"], "file", [("Video", "*.mp4 *.mkv *.mov *.avi *.webm *.ts"), ("Tất cả", "*.*")]))
@@ -245,7 +269,7 @@ class App(tk.Tk):
         ttk.Button(f, text="Chọn thư mục nhạc", command=lambda: self._pick(v["music_path"], "dir")).grid(row=3, column=1, sticky="w")
         self._row(f, 4, "Âm lượng nhạc", lambda x: ttk.Scale(x, from_=0.0, to=0.6, variable=v["music_volume"]))
         self._row(f, 5, "Âm thanh gốc phim", lambda x: ttk.Scale(x, from_=0.0, to=1.0, variable=v["orig_volume"]))
-        ttk.Checkbutton(f, text="Đốt phụ đề lên video (xuất kèm .srt)", variable=v["subtitles"]).grid(row=6, column=0, columnspan=2, sticky="w")
+        ttk.Checkbutton(f, text="Đốt phụ đề lên video", variable=v["subtitles"]).grid(row=6, column=0, columnspan=2, sticky="w")
         self._row(f, 7, "Bộ mã hoá", lambda x: ttk.Combobox(x, textvariable=v["encoder"], state="readonly", values=["libx264", "h264_nvenc"]))
 
         f = self._card(p, "🎧 Bộ kiểm âm trực tiếp")
@@ -260,7 +284,7 @@ class App(tk.Tk):
         top = ttk.LabelFrame(p, text="📋 Bảng phân cảnh đã chọn (sau khi cắt)", style="Card.TLabelframe", padding=6)
         top.pack(fill="both", expand=True, padx=8, pady=(6, 3))
         cols = ("stt", "pos", "dur", "kind", "score", "note")
-        self.tv_shots = ttk.Treeview(top, columns=cols, show="headings", height=8)
+        self.tv_shots = ttk.Treeview(top, columns=cols, show="headings", height=6, selectmode="browse")
         for c, t, w in (("stt", "STT", 40), ("pos", "Vị trí phim", 120), ("dur", "Thời lượng", 80),
                         ("kind", "Loại cảnh (motion/mặt)", 180), ("score", "Điểm", 60), ("note", "Ghi chú / Thoại nút thắt", 360)):
             self.tv_shots.heading(c, text=t)
@@ -269,6 +293,8 @@ class App(tk.Tk):
         self.tv_shots.configure(yscrollcommand=sb.set)
         self.tv_shots.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
+        self.tv_shots.bind("<<TreeviewSelect>>", self._on_shot)
+        self._build_preview(p)
 
         gf = ttk.LabelFrame(p, text="🎭 Thể loại nội dung (Genre Bias)", style="Card.TLabelframe", padding=8)
         gf.pack(fill="x", padx=8, pady=3)
@@ -343,26 +369,18 @@ class App(tk.Tk):
         v = self.v
         st = self.st
         g = lambda k: v[k].get()
-
-        groq_k = g("groq_key").strip()
-        groq_m = g("groq_model").strip()
-        gem_k = g("gemini_key").strip()
-        gem_m = g("gemini_model").strip()
-
-        setattr(st, "groq_key", groq_k)
-        setattr(st, "groq_model", groq_m or "llama-3.3-70b-versatile")
-
-        # Đảm bảo st.gemini_key luôn có giá trị để pipeline kích hoạt bộ não AI
-        if groq_k:
-            st.gemini_key = groq_k
-            st.gemini_model = groq_m or "llama-3.3-70b-versatile"
-        elif gem_k:
-            st.gemini_key = gem_k
-            st.gemini_model = gem_m or "gemini-1.5-flash"
-        else:
-            st.gemini_key = "ollama"
-            st.gemini_model = "qwen2.5:7b"
-
+        st.groq_key, st.gemini_key = g("groq_key").strip(), g("gemini_key").strip()
+        st.groq_model = g("groq_model").strip() or "llama-3.3-70b-versatile"
+        st.groq_vision_model = g("groq_vision_model").strip() or "meta-llama/llama-4-scout-17b-16e-instruct"
+        try:
+            st.groq_rpm = max(1, min(30, int(g("groq_rpm"))))
+        except (ValueError, tk.TclError):
+            st.groq_rpm = 25
+        st.gemini_model = g("gemini_model").strip() or "gemini-flash-latest"
+        st.ai_fallback = next((k for k, t in self.FALLBACK_LABELS.items() if t == g("ai_fallback")), "ask")
+        st.ollama_model, st.ollama_vision_model = g("ollama_model").strip() or "qwen2.5:7b", g("ollama_vision_model").strip()
+        st.output_name, st.output_dir = g("output_name").strip(), g("output_dir").strip()
+        st.cleanup_temp, st.export_srt = g("cleanup_temp"), g("export_srt")
         st.workdir, st.title = g("workdir").strip(), g("title").strip()
         st.whisper_model, st.whisper_lang = g("whisper_model"), g("whisper_lang")
         st.video, st.srt_path = g("video").strip(), g("srt_path").strip()
@@ -386,18 +404,205 @@ class App(tk.Tk):
     def _save(self):
         st = self._collect()
         save_settings(st)
-        cfg_path = Path.home() / ".reviewcut" / "config.json"
-        if cfg_path.is_file():
+        messagebox.showinfo("ReviewCut", "Đã lưu cấu hình.\n(Key được lưu trong ~/.reviewcut/config.json – chỉ máy bạn đọc được.)")
+
+    def _on_video_changed(self):
+        vp = self.v["video"].get().strip()
+        if vp and Path(vp).is_file() and not self.busy and not self.tv_shots.selection():
+            self._pv_load("src", None)
+
+    def _show_outpath(self):
+        try:
+            st = self._collect()
+            if not st.video:
+                self.lbl_out.config(text="")
+                return
+            self.lbl_out.config(text="→ Video sẽ được lưu tại: " + str(Project(st).output_path()))
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ------------------------------------------------------------ kiểm tra kết nối
+    def _check_conn(self):
+        if self.busy:
+            return
+        st = self._collect()
+        self._log("🔌 Đang kiểm tra Groq / Gemini / Ollama / giọng đọc…")
+
+        def work():
             try:
-                data = json.loads(cfg_path.read_text(encoding="utf-8"))
-                data["groq_key"] = self.v["groq_key"].get().strip()
-                data["groq_model"] = self.v["groq_model"].get().strip()
-                data["gemini_key"] = self.v["gemini_key"].get().strip()
-                data["gemini_model"] = self.v["gemini_model"].get().strip()
-                cfg_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-            except Exception:
-                pass
-        messagebox.showinfo("ReviewCut", f"Đã lưu cấu hình AI thành công tại:\n{cfg_path}")
+                from reviewcut import tts
+                lines = []
+                for name, ok, msg in Project(st).ai_client().diagnose():
+                    lines.append(f"{'✔' if ok else '✖'} {name}: {msg}")
+                ok, msg = tts.check_connection(st)
+                lines.append(f"{'✔' if ok else '✖'} Giọng đọc (bước 3): {msg}")
+                self.q.put(("diag", "\n\n".join(lines)))
+            except Exception as ex:  # noqa: BLE001
+                self.q.put(("diag", f"Không kiểm tra được: {ex}"))
+        threading.Thread(target=work, daemon=True).start()
+
+    # ------------------------------------------------------------ hỏi khi AI đám mây lỗi (1 lần / bước)
+    def _ask_from_thread(self, ctx: dict) -> str:
+        holder = {"ev": threading.Event(), "ans": "offline"}
+        self.q.put(("ask", (ctx, holder)))
+        while not holder["ev"].wait(0.3):
+            if self.job and self.job.cancel_event.is_set():
+                return "cancel"
+        return holder["ans"]
+
+    def _ask_dialog(self, ctx: dict, holder: dict):
+        win = tk.Toplevel(self)
+        win.title("AI đám mây gặp lỗi")
+        win.transient(self)
+        win.configure(bg=CARD)
+        win.resizable(False, False)
+        body = ttk.Frame(win, padding=14)
+        body.pack(fill="both")
+        ttk.Label(body, text=f"⚠ Groq/Gemini lỗi ở: {ctx['stage']}", font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        err_txt = "\n\n".join(str(e) for e in ctx["errors"]) or "Chưa cấu hình key Groq/Gemini."
+        ttk.Label(body, text=err_txt, wraplength=560, justify="left", foreground=RED).pack(anchor="w", pady=8)
+        ttk.Label(body, text="Ollama: " + ctx["ollama_msg"], wraplength=560, justify="left", style="Muted.TLabel").pack(anchor="w")
+        ttk.Label(body, text="Lựa chọn này áp dụng cho CẢ BƯỚC; bước sau sẽ thử Groq/Gemini lại.", wraplength=560,
+                  justify="left", font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(8, 10))
+        res = {"v": "offline"}
+
+        def pick(x):
+            res["v"] = x
+            win.destroy()
+        row = ttk.Frame(body)
+        row.pack(fill="x")
+        b1 = ttk.Button(row, text=f"Dùng Ollama ({ctx['ollama_model']})", style="Teal.TButton", command=lambda: pick("ollama"))
+        b1.pack(side="left", padx=3)
+        if not ctx["can_ollama"]:
+            b1.state(["disabled"])
+        ttk.Button(row, text="Dùng kịch bản dự phòng", style="Orange.TButton", command=lambda: pick("offline")).pack(side="left", padx=3)
+        ttk.Button(row, text="Dừng", style="Red.TButton", command=lambda: pick("cancel")).pack(side="left", padx=3)
+        win.protocol("WM_DELETE_WINDOW", lambda: pick("cancel"))
+        win.update_idletasks()
+        win.geometry(f"+{self.winfo_rootx() + 80}+{self.winfo_rooty() + 80}")
+        win.grab_set()
+        self.wait_window(win)
+        holder["ans"] = res["v"]
+        holder["ev"].set()
+
+    # ------------------------------------------------------------ xem trước hình ảnh
+    def _build_preview(self, parent):
+        pf = ttk.LabelFrame(parent, text="🖼 Xem trước hình ảnh (chọn 1 dòng trong bảng phân cảnh / khối kịch bản)",
+                            style="Card.TLabelframe", padding=6)
+        pf.pack(fill="x", padx=8, pady=3)
+        self.pv_imgs: list = []
+        self.pv_gen = 0
+        row = ttk.Frame(pf)
+        row.pack(fill="x")
+        self.pv_labels, self.pv_caps = [], []
+        for i in range(5):
+            col = ttk.Frame(row)
+            col.grid(row=0, column=i, padx=3)
+            lb = tk.Label(col, bg="#111827", width=22, height=7, cursor="hand2")
+            lb.pack()
+            lb.bind("<Button-1>", lambda e, k=i: self._pv_zoom(k))
+            cp = ttk.Label(col, text="", style="Muted.TLabel")
+            cp.pack()
+            self.pv_labels.append(lb)
+            self.pv_caps.append(cp)
+        bar = ttk.Frame(pf)
+        bar.pack(fill="x", pady=(4, 0))
+        self.lbl_pv = ttk.Label(bar, text="Chưa chọn shot nào. Bấm vào ảnh để xem lớn.", style="Muted.TLabel")
+        self.lbl_pv.pack(side="left")
+        ttk.Button(bar, text="↻ Cập nhật theo hiệu ứng hiện tại", command=self._pv_refresh).pack(side="right")
+        self.pv_paths: list[str] = []
+
+    def _pv_dir(self) -> str:
+        if self.project:
+            return str(self.project.wd)
+        d = os.path.join(tempfile.gettempdir(), "reviewcut_preview")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _pv_show(self, paths: list[str], caps: list[str], note: str, gen: int):
+        if gen != self.pv_gen:
+            return
+        self.pv_imgs, self.pv_paths = [], list(paths)
+        for i, lb in enumerate(self.pv_labels):
+            if i < len(paths) and paths[i]:
+                try:
+                    img = tk.PhotoImage(file=paths[i])
+                    self.pv_imgs.append(img)
+                    lb.configure(image=img, width=img.width(), height=img.height())
+                    self.pv_caps[i].config(text=caps[i])
+                    continue
+                except tk.TclError:
+                    pass
+            lb.configure(image="", width=22, height=7)
+            self.pv_caps[i].config(text="")
+        self.lbl_pv.config(text=note)
+
+    def _pv_load(self, kind: str, obj):
+        """Tạo ảnh ở luồng nền (ffmpeg) rồi hiện lên giao diện. kind: shot | block | src."""
+        st = self._collect()
+        video, wd = st.video, self._pv_dir()
+        self.pv_gen += 1
+        gen = self.pv_gen
+        self.lbl_pv.config(text="Đang tạo ảnh xem trước…")
+
+        def work():
+            try:
+                if kind == "shot":
+                    a, b, c = pv.shot_frames(video, obj, wd, 240)
+                    fx = pv.effect_frame(video, obj, st, wd)
+                    paths, caps = [a, b, c, fx], ["đầu", "giữa", "cuối", "có hiệu ứng"]
+                    note = f"Shot {fmt_time(obj.start)}–{fmt_time(obj.end)} · {obj.dur:.1f}s · {obj.kind}" + \
+                           (" · mô tả AI: " + obj.caption if obj.caption_ai else "")
+                elif kind == "block":
+                    paths = pv.block_frames(video, obj, wd, 200)[:5]
+                    caps = [f"shot {i + 1}" for i in range(len(paths))]
+                    note = f"Khối #{obj.id + 1}: {len(obj.shots)} shot · {obj.dur:.0f}s"
+                else:
+                    paths, caps, note = [pv.source_thumb(video, wd, 0, 240)], ["video gốc"], "Ảnh đại diện video gốc"
+                self.q.put(("pv", (paths, caps, note, gen)))
+            except Exception as ex:  # noqa: BLE001
+                self.q.put(("pv", ([], [], f"Không tạo được ảnh xem trước: {str(ex)[:120]}", gen)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _selected_shot(self):
+        sel = self.tv_shots.selection()
+        return self.shot_rows.get(sel[0]) if sel else None
+
+    def _on_shot(self, _=None):
+        sh = self._selected_shot()
+        if sh and self.v["video"].get() and Path(self.v["video"].get()).is_file():
+            self._pv_load("shot", sh)
+
+    def _pv_refresh(self):
+        sh = self._selected_shot()
+        if sh:
+            self._pv_load("shot", sh)
+        elif self._block():
+            self._pv_load("block", self._block())
+        elif Path(self.v["video"].get()).is_file():
+            self._pv_load("src", None)
+
+    def _pv_zoom(self, k: int):
+        if k >= len(self.pv_paths) or not self.pv_paths[k]:
+            return
+        sh = self._selected_shot()
+        win = tk.Toplevel(self)
+        win.title("Xem ảnh lớn")
+        path = self.pv_paths[k]
+        try:
+            if sh and k < 4:                     # tạo bản lớn từ video
+                from reviewcut.vision import grab_frame
+                t = [sh.start + 0.1, (sh.start + sh.end) / 2, sh.end - 0.15][k] if k < 3 else None
+                big = os.path.join(self._pv_dir(), f"big_{k}.png")
+                if t is not None:
+                    grab_frame(self.v["video"].get(), t, big, None, width=960, fmt="png")
+                    path = big
+            img = tk.PhotoImage(file=path)
+            lb = tk.Label(win, image=img)
+            lb.image = img
+            lb.pack()
+        except Exception as ex:  # noqa: BLE001
+            ttk.Label(win, text=f"Không mở được ảnh: {ex}").pack(padx=20, pady=20)
 
     # ------------------------------------------------------------ chạy nền
     def _set_busy(self, b):
@@ -415,7 +620,7 @@ class App(tk.Tk):
             if not st.video or not Path(st.video).is_file():
                 raise RuntimeError("Hãy chọn video gốc trước.")
             find_tool("ffmpeg")
-            proj = Project(st)
+            proj = Project(st, asker=self._ask_from_thread)
             if which in ("2", "3"):
                 if not proj.load():
                     raise RuntimeError("Chưa có kết quả bước 1 cho video này – hãy chạy bước 1 trước.")
@@ -430,28 +635,19 @@ class App(tk.Tk):
 
         def work():
             try:
-                target_dir = Path(st.workdir) if st.workdir else Path(st.video).parent
-                target_dir.mkdir(parents=True, exist_ok=True)
-                raw_title = st.title.strip()
-                if raw_title:
-                    safe_name = re.sub(r'[\\/*?:"<>|]', "", raw_title)
-                    out_path = str(target_dir / f"{safe_name}.mp4")
-                else:
-                    out_path = str(target_dir / f"{Path(st.video).stem}_review.mp4")
-
                 if which == "1":
                     proj.stage1_analyze_and_cut(self.job)
                 elif which == "2":
                     proj.stage2_script(self.job)
                 elif which == "3":
-                    out = proj.stage3_render(self.job, out_path=out_path)
+                    out = proj.stage3_render(self.job)
                     self.q.put(("done_render", out))
                 else:
                     proj.stage1_analyze_and_cut(self.job)
                     self.q.put(("refresh", None))
                     proj.stage2_script(self.job)
                     self.q.put(("refresh", None))
-                    out = proj.stage3_render(self.job, out_path=out_path)
+                    out = proj.stage3_render(self.job)
                     self.q.put(("done_render", out))
             except Cancelled:
                 self.q.put(("log", "⏹ Đã dừng."))
@@ -483,8 +679,15 @@ class App(tk.Tk):
                 elif k == "error":
                     self._log("✖ " + d)
                     messagebox.showerror("ReviewCut", d)
+                elif k == "ask":
+                    self._ask_dialog(*d)
+                elif k == "diag":
+                    self._log("🔌 Kết quả kiểm tra:\n" + d)
+                    messagebox.showinfo("Kiểm tra kết nối", d)
+                elif k == "pv":
+                    self._pv_show(*d)
                 elif k == "done_render":
-                    if messagebox.askyesno("ReviewCut", f"Dựng xong!\n{d}\n\nMở thư mục chứa video?"):
+                    if messagebox.askyesno("ReviewCut", f"Dựng xong! Kết quả là 1 file video:\n{d}\n\nMở thư mục chứa video?"):
                         self._open_dir(Path(d).parent)
         except queue.Empty:
             pass
@@ -506,18 +709,20 @@ class App(tk.Tk):
         pr = self.project
         self.tv_shots.delete(*self.tv_shots.get_children())
         self.tv_blocks.delete(*self.tv_blocks.get_children())
+        self.shot_rows = {}
         if not pr:
             return
         n = 0
         for b in pr.blocks:
             for s in b.shots:
                 n += 1
-                note = s.caption
+                note = ("👁 " if s.caption_ai else "≈ ") + s.caption
                 if s.must and s.tags:
                     note = f"★ {', '.join(s.tags)} · " + note
                 if s.role == "outro":
                     note = "OUTRO · " + note
-                self.tv_shots.insert("", "end", values=(n, f"{fmt_time(s.start)}–{fmt_time(s.end)}", f"{s.dur:.1f}s",
+                self.shot_rows[str(n)] = s
+                self.tv_shots.insert("", "end", iid=str(n), values=(n, f"{fmt_time(s.start)}–{fmt_time(s.end)}", f"{s.dur:.1f}s",
                                                         s.kind, f"{s.score:.2f}", note))
             words = len(b.text.split())
             lim = max_words(b, self.st) if b.role == "main" else 0
@@ -532,6 +737,8 @@ class App(tk.Tk):
 
     def _on_block(self, _=None):
         b = self._block()
+        if b and self.v["video"].get() and Path(self.v["video"].get()).is_file() and not self.tv_shots.selection():
+            self._pv_load("block", b)
         self.txt.delete("1.0", "end")
         if b:
             self.txt.insert("1.0", b.text)
@@ -569,7 +776,8 @@ class App(tk.Tk):
                 tts.preview(text, st, mp3)
                 self.after(0, lambda: self._play(mp3))
             except Exception as ex:  # noqa: BLE001
-                self.after(0, lambda: self.lbl_prev.config(text="Lỗi: " + str(ex)[:80]))
+                msg = str(ex).splitlines()[0][:90]
+                self.after(0, lambda: self.lbl_prev.config(text="Lỗi: " + msg))
         threading.Thread(target=work, daemon=True).start()
 
     def _play(self, mp3):
