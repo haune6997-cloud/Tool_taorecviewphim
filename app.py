@@ -29,6 +29,7 @@ import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from PIL import Image, ImageTk
 
 from reviewcut import __version__
 from reviewcut.config import (ASPECTS, GENRES, GRADES, VOICES, Settings, load_settings, save_settings)
@@ -142,12 +143,24 @@ class App(tk.Tk):
         cv.configure(yscrollcommand=sb.set)
         cv.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
+
+        # Chặn lăn chuột làm nhảy giá trị Combobox ngoài ý muốn
+        self.bind_class("TCombobox", "<MouseWheel>", lambda e: "break")
+        self.bind_class("TCombobox", "<Button-4>", lambda e: "break")
+        self.bind_class("TCombobox", "<Button-5>", lambda e: "break")
+
         def wheel(e):
-            if self.focus_get() and "combobox" in str(self.focus_get()).lower():
+            w = e.widget
+            # Nếu chuột đang trỏ vào bảng Treeview hoặc ô Text bên phải thì để bảng đó tự cuộn
+            if isinstance(w, (ttk.Treeview, tk.Text)):
                 return
-            cv.yview_scroll(-1 if (e.num == 4 or e.delta > 0) else 1, "units")
-        for ev in ("<MouseWheel>", "<Button-4>", "<Button-5>"):      # Windows/macOS: MouseWheel · Linux: Button-4/5
-            cv.bind_all(ev, wheel)
+            # Chỉ cuộn cột trái khi chuột đang nằm bên cột trái
+            if str(w).startswith(str(left_outer)):
+                cv.yview_scroll(-1 if (e.num == 4 or e.delta > 0) else 1, "units")
+
+        for ev in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.bind_all(ev, wheel)
+
         paned.add(left_outer, weight=2)
         right = ttk.Frame(paned)
         paned.add(right, weight=3)
@@ -175,7 +188,7 @@ class App(tk.Tk):
         self._row(f, 1, "Model Groq (chữ)", lambda x: ttk.Combobox(x, textvariable=v["groq_model"],
             values=["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "openai/gpt-oss-20b"]))
         self._row(f, 2, "Model Groq (ảnh)", lambda x: ttk.Combobox(x, textvariable=v["groq_vision_model"],
-            values=["meta-llama/llama-4-scout-17b-16e-instruct"]))
+            values=["llama-3.2-11b-vision-preview", "llama-3.2-90b-vision-preview", "meta-llama/llama-4-scout-17b-16e-instruct"]))
         r = ttk.Frame(f)
         ttk.Spinbox(r, from_=5, to=30, width=5, textvariable=v["groq_rpm"]).pack(side="left")
         ttk.Label(r, text="request/phút (Groq free tối đa 30 → nên để 25)").pack(side="left", padx=6)
@@ -211,7 +224,7 @@ class App(tk.Tk):
         f = self._card(p, "🗣 Nhận dạng thoại")
         self._row(f, 0, "Whisper model", lambda x: ttk.Combobox(x, textvariable=v["whisper_model"], state="readonly",
                                                               values=["tiny", "base", "small", "medium", "large-v3"]))
-        self._row(f, 1, "Ngôn ngữ phim", lambda x: ttk.Combobox(x, textvariable=v["whisper_lang"],
+        self._row(f, 1, "Ngôn ngữ phim", lambda x: ttk.Combobox(x, textvariable=v["whisper_lang"], state="readonly",
                                                                values=["auto", "vi", "en", "zh", "ko", "ja", "th", "fr", "es"]))
 
         f = self._card(p, "🎞 Video đầu vào & phân cảnh AI")
@@ -282,9 +295,9 @@ class App(tk.Tk):
     def _right(self, p):
         v = self.v
         top = ttk.LabelFrame(p, text="📋 Bảng phân cảnh đã chọn (sau khi cắt)", style="Card.TLabelframe", padding=6)
-        top.pack(fill="both", expand=True, padx=8, pady=(6, 3))
+        top.pack(fill="both", expand=True, padx=8, pady=(6, 2))
         cols = ("stt", "pos", "dur", "kind", "score", "note")
-        self.tv_shots = ttk.Treeview(top, columns=cols, show="headings", height=6, selectmode="browse")
+        self.tv_shots = ttk.Treeview(top, columns=cols, show="headings", height=4, selectmode="browse")
         for c, t, w in (("stt", "STT", 40), ("pos", "Vị trí phim", 120), ("dur", "Thời lượng", 80),
                         ("kind", "Loại cảnh (motion/mặt)", 180), ("score", "Điểm", 60), ("note", "Ghi chú / Thoại nút thắt", 360)):
             self.tv_shots.heading(c, text=t)
@@ -296,18 +309,18 @@ class App(tk.Tk):
         self.tv_shots.bind("<<TreeviewSelect>>", self._on_shot)
         self._build_preview(p)
 
-        gf = ttk.LabelFrame(p, text="🎭 Thể loại nội dung (Genre Bias)", style="Card.TLabelframe", padding=8)
-        gf.pack(fill="x", padx=8, pady=3)
+        gf = ttk.LabelFrame(p, text="🎭 Thể loại nội dung (Genre Bias)", style="Card.TLabelframe", padding=6)
+        gf.pack(fill="x", padx=8, pady=2)
         gf.columnconfigure(0, weight=1)
         cb = ttk.Combobox(gf, textvariable=v["genre"], values=list(GENRES), state="readonly")
         cb.grid(row=0, column=0, sticky="ew")
         cb.bind("<<ComboboxSelected>>", lambda e: self._genre_info())
         self.lbl_genre = ttk.Label(gf, text="", style="Muted.TLabel", wraplength=800, justify="left")
-        self.lbl_genre.grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.lbl_genre.grid(row=1, column=0, sticky="w", pady=(2, 0))
         self._genre_info()
 
         bf = ttk.Frame(p)
-        bf.pack(fill="x", padx=8, pady=3)
+        bf.pack(fill="x", padx=8, pady=2)
         self.b2 = ttk.Button(bf, text="2. Viết kịch bản", style="Orange.TButton", command=lambda: self._run("2"))
         self.b3 = ttk.Button(bf, text="3. Lồng tiếng + Dựng", style="Green.TButton", command=lambda: self._run("3"))
         self.ba = ttk.Button(bf, text="⚡ Tự động 1→2→3", style="Blue.TButton", command=lambda: self._run("all"))
@@ -317,12 +330,12 @@ class App(tk.Tk):
             bf.columnconfigure(i, weight=3 if i < 3 else 1)
 
         sf = ttk.LabelFrame(p, text="📝 Kịch bản lời bình (chỉnh tay được)", style="Card.TLabelframe", padding=6)
-        sf.pack(fill="both", expand=True, padx=8, pady=3)
+        sf.pack(fill="both", expand=True, padx=8, pady=2)
         sf.columnconfigure(0, weight=1, minsize=250)
         sf.columnconfigure(1, weight=3)
         sf.rowconfigure(0, weight=1)
         cols = ("id", "pos", "dur", "words")
-        self.tv_blocks = ttk.Treeview(sf, columns=cols, show="headings", height=6, selectmode="browse")
+        self.tv_blocks = ttk.Treeview(sf, columns=cols, show="headings", height=4, selectmode="browse")
         for c, t, w in (("id", "#", 28), ("pos", "Khối", 64), ("dur", "Dài", 44), ("words", "Từ/Tối đa", 84)):
             self.tv_blocks.heading(c, text=t)
             self.tv_blocks.column(c, width=w, anchor="center")
@@ -332,7 +345,7 @@ class App(tk.Tk):
         ed.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
         ed.rowconfigure(0, weight=1)
         ed.columnconfigure(0, weight=1)
-        self.txt = tk.Text(ed, wrap="word", height=6, font=("Segoe UI", 11), undo=True)
+        self.txt = tk.Text(ed, wrap="word", height=4, font=("Segoe UI", 11), undo=True)
         self.txt.grid(row=0, column=0, sticky="nsew")
         self.txt.bind("<KeyRelease>", lambda e: self._count())
         r = ttk.Frame(ed)
@@ -342,13 +355,18 @@ class App(tk.Tk):
         ttk.Button(r, text="✔ Áp dụng cho khối này", command=self._apply_block).pack(side="right")
 
         lf = ttk.LabelFrame(p, text="🧾 Nhật ký xử lý", style="Card.TLabelframe", padding=6)
-        lf.pack(fill="both", padx=8, pady=(3, 8))
+        lf.pack(fill="both", expand=True, padx=8, pady=(2, 6))
         self.pb = ttk.Progressbar(lf, maximum=1.0)
         self.pb.pack(fill="x")
         self.lbl_prog = ttk.Label(lf, text="", style="Muted.TLabel")
         self.lbl_prog.pack(anchor="w")
-        self.log = tk.Text(lf, height=7, wrap="word", bg="#fbfbfc", font=("Consolas", 9), state="disabled")
-        self.log.pack(fill="both", expand=True)
+        log_box = ttk.Frame(lf)
+        log_box.pack(fill="both", expand=True, pady=(2, 0))
+        self.log = tk.Text(log_box, height=5, wrap="word", bg="#fbfbfc", font=("Consolas", 9), state="disabled")
+        sb_log = ttk.Scrollbar(log_box, orient="vertical", command=self.log.yview)
+        self.log.configure(yscrollcommand=sb_log.set)
+        self.log.pack(side="left", fill="both", expand=True)
+        sb_log.pack(side="right", fill="y")
         self._log("Sẵn sàng. Chọn video → bấm 1 để cắt cảnh trước; kịch bản chỉ được viết SAU khi đã cắt.")
 
     # ------------------------------------------------------------ helpers
@@ -371,7 +389,7 @@ class App(tk.Tk):
         g = lambda k: v[k].get()
         st.groq_key, st.gemini_key = g("groq_key").strip(), g("gemini_key").strip()
         st.groq_model = g("groq_model").strip() or "llama-3.3-70b-versatile"
-        st.groq_vision_model = g("groq_vision_model").strip() or "meta-llama/llama-4-scout-17b-16e-instruct"
+        st.groq_vision_model = g("groq_vision_model").strip() or "llama-3.2-11b-vision-preview"
         try:
             st.groq_rpm = max(1, min(30, int(g("groq_rpm"))))
         except (ValueError, tk.TclError):
@@ -489,7 +507,7 @@ class App(tk.Tk):
     def _build_preview(self, parent):
         pf = ttk.LabelFrame(parent, text="🖼 Xem trước hình ảnh (chọn 1 dòng trong bảng phân cảnh / khối kịch bản)",
                             style="Card.TLabelframe", padding=6)
-        pf.pack(fill="x", padx=8, pady=3)
+        pf.pack(fill="x", padx=8, pady=2)
         self.pv_imgs: list = []
         self.pv_gen = 0
         row = ttk.Frame(pf)
@@ -498,7 +516,7 @@ class App(tk.Tk):
         for i in range(5):
             col = ttk.Frame(row)
             col.grid(row=0, column=i, padx=3)
-            lb = tk.Label(col, bg="#111827", width=22, height=7, cursor="hand2")
+            lb = tk.Label(col, bg="#111827", width=22, height=6, cursor="hand2")
             lb.pack()
             lb.bind("<Button-1>", lambda e, k=i: self._pv_zoom(k))
             cp = ttk.Label(col, text="", style="Muted.TLabel")
@@ -526,14 +544,19 @@ class App(tk.Tk):
         for i, lb in enumerate(self.pv_labels):
             if i < len(paths) and paths[i]:
                 try:
-                    img = tk.PhotoImage(file=paths[i])
+                    pil_img = Image.open(paths[i])
+                    if hasattr(Image, "Resampling"):
+                        pil_img.thumbnail((176, 99), Image.Resampling.LANCZOS)
+                    else:
+                        pil_img.thumbnail((176, 99), Image.ANTIALIAS)
+                    img = ImageTk.PhotoImage(pil_img)
                     self.pv_imgs.append(img)
-                    lb.configure(image=img, width=img.width(), height=img.height())
+                    lb.configure(image=img, width=176, height=99)
                     self.pv_caps[i].config(text=caps[i])
                     continue
-                except tk.TclError:
+                except Exception:  # noqa: BLE001
                     pass
-            lb.configure(image="", width=22, height=7)
+            lb.configure(image="", width=22, height=6)
             self.pv_caps[i].config(text="")
         self.lbl_pv.config(text=note)
 
@@ -588,6 +611,7 @@ class App(tk.Tk):
         sh = self._selected_shot()
         win = tk.Toplevel(self)
         win.title("Xem ảnh lớn")
+        win.transient(self)
         path = self.pv_paths[k]
         try:
             if sh and k < 4:                     # tạo bản lớn từ video
@@ -597,7 +621,12 @@ class App(tk.Tk):
                 if t is not None:
                     grab_frame(self.v["video"].get(), t, big, None, width=960, fmt="png")
                     path = big
-            img = tk.PhotoImage(file=path)
+            pil_img = Image.open(path)
+            if hasattr(Image, "Resampling"):
+                pil_img.thumbnail((960, 540), Image.Resampling.LANCZOS)
+            else:
+                pil_img.thumbnail((960, 540), Image.ANTIALIAS)
+            img = ImageTk.PhotoImage(pil_img)
             lb = tk.Label(win, image=img)
             lb.image = img
             lb.pack()
@@ -774,25 +803,28 @@ class App(tk.Tk):
                 from reviewcut import tts
                 mp3 = os.path.join(tempfile.gettempdir(), "reviewcut_preview.mp3")
                 tts.preview(text, st, mp3)
-                self.after(0, lambda: self._play(mp3))
+                if sys.platform.startswith("win"):
+                    wav = mp3.replace(".mp3", ".wav")
+                    subprocess.run([find_tool("ffmpeg"), "-y", "-v", "error", "-i", mp3, wav], check=True,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    self.after(0, lambda: self._play(wav))
+                else:
+                    self.after(0, lambda: self._play(mp3))
             except Exception as ex:  # noqa: BLE001
                 msg = str(ex).splitlines()[0][:90]
                 self.after(0, lambda: self.lbl_prev.config(text="Lỗi: " + msg))
         threading.Thread(target=work, daemon=True).start()
 
-    def _play(self, mp3):
+    def _play(self, audio_path):
         try:
             if sys.platform.startswith("win"):
                 import winsound
-                wav = mp3.replace(".mp3", ".wav")
-                subprocess.run([find_tool("ffmpeg"), "-y", "-v", "error", "-i", mp3, wav], check=True,
-                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                winsound.PlaySound(wav, winsound.SND_FILENAME | winsound.SND_ASYNC)
+                winsound.PlaySound(audio_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
             elif sys.platform == "darwin":
-                self.play_proc = subprocess.Popen(["afplay", mp3])
+                self.play_proc = subprocess.Popen(["afplay", audio_path])
             else:
                 ffplay = shutil.which("ffplay")
-                cmd = [ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet", mp3] if ffplay else ["xdg-open", mp3]
+                cmd = [ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet", audio_path] if ffplay else ["xdg-open", audio_path]
                 self.play_proc = subprocess.Popen(cmd)
             self.lbl_prev.config(text="Đang phát…")
         except Exception as ex:  # noqa: BLE001
