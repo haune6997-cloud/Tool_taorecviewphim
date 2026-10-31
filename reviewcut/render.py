@@ -43,7 +43,7 @@ def plan_timing(blocks: list[Block], raw_voice: dict[int, float], st: Settings) 
         if b.role == "main" and b.text.strip() and raw_voice.get(b.id, 0) > 0:
             v = raw_voice[b.id]
             if v + LEAD + TAIL > eff:
-                at = min(MAX_VOICE_SPEEDUP, (v) / max(0.5, eff * MAX_STRETCH - LEAD - TAIL))
+                at = min(MAX_VOICE_SPEEDUP, v / max(0.5, eff * MAX_STRETCH - LEAD - TAIL))
                 at = max(1.0, at)
             v /= at
         total = max(eff, v + LEAD + TAIL if v else eff)
@@ -289,18 +289,22 @@ def render_all(video: str, blocks: list[Block], st: Settings, workdir: str, out_
         else:
             job.log("⚠ ffmpeg không có libass → không đốt được phụ đề lên hình.")
 
-    # 5) trộn âm thanh + (tuỳ chọn) đốt phụ đề → ghi ra file tạm rồi đổi tên (không để lại file dở nếu lỗi/huỷ)
-    job.progress(0.80, "Trộn âm thanh & xuất file…")
+    # 5) trộn âm thanh + Audio Ducking + (tuỳ chọn) đốt phụ đề
+    job.progress(0.80, "Trộn âm thanh (Audio Ducking) & xuất file…")
     music = pick_music(st.music_path, seed=len(blocks))
     cmd = [ff, "-y", "-v", "error", "-i", main_mp4, "-i", voice_wav]
     if music:
         cmd += ["-stream_loop", "-1", "-i", music]
     fc = [f"[0:a]volume={st.orig_volume:.3f},aresample=48000,aformat=channel_layouts=stereo[o]"]
     if music:
-        fc += ["[1:a]asplit=2[vo][vs]",
-               f"[2:a]volume={st.music_volume:.3f},aresample=48000,aformat=channel_layouts=stereo[m]",
-               "[m][vs]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=400[md]",
-               "[o][vo][md]amix=inputs=3:duration=first:dropout_transition=0:normalize=0,alimiter=limit=0.95[a]"]
+        # Tách giọng đọc làm 2 luồng: [vo] để mix ra ngoài, [vs] làm bộ kích hoạt sidechain
+        # Nhạc nền [m] tự động giảm khi [vs] có tiếng nói và dâng lên êm ái khi dứt câu
+        fc += [
+            "[1:a]asplit=2[vo][vs]",
+            f"[2:a]volume={st.music_volume:.3f},aresample=48000,aformat=channel_layouts=stereo[m]",
+            "[m][vs]sidechaincompress=threshold=0.04:ratio=6:attack=15:release=350[md]",
+            "[o][vo][md]amix=inputs=3:duration=first:dropout_transition=2:normalize=0,alimiter=limit=0.95[a]"
+        ]
     else:
         fc += ["[o][1:a]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,alimiter=limit=0.95[a]"]
     if burn:

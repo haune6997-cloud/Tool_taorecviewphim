@@ -153,13 +153,70 @@ class Project:
 
     # ------------------------------------------------------------ giai đoạn 2
     def stage2_script(self, job: Job) -> list[Block]:
-        from .script import write_script
+        from .script import generate_story_script, summarize_plot, write_script
+        from .matcher import match_story_to_shots
+
         if not self.blocks:
             raise RuntimeError("Chạy bước 1 (phân tích & cắt cảnh) trước.")
-        job.log("② Viết kịch bản bám sát các shot đã cắt…")
-        write_script(self.blocks, self.st, self.gemini(), job)
+
+        job.log("② Viết kịch bản dẫn đường (Script-First) & Khớp cảnh ngữ nghĩa…")
+        job.progress(0.05, "Chuẩn bị AI và dữ liệu kho cảnh")
+        ai = self.ai_client("script", job)
+
+        # 1. Thu thập toàn bộ các shot ứng viên cắt được ở Bước 1
+        candidate_shots: list[Shot] = []
+        seen_shots = set()
+        for b in self.blocks:
+            for s in b.shots:
+                sid = (round(s.start, 2), round(s.end, 2))
+                if sid not in seen_shots:
+                    seen_shots.add(sid)
+                    # Gán thoại gốc tương ứng vào shot nếu chưa có để matcher đo ngữ nghĩa
+                    if not getattr(s, "dialogue", None):
+                        s.dialogue = [
+                            {"t": l.start, "text": l.text, "plot": l.plot}
+                            for l in self.lines
+                            if s.start <= l.start <= s.end
+                        ]
+                    candidate_shots.append(s)
+
+        job.log(f"   ↳ Kho cảnh ứng viên: {len(candidate_shots)} shot.")
+
+        # 2. Lấy summary từ hàm summarize_plot()
+        job.progress(0.15, "AI đọc thoại & tóm tắt cốt truyện toàn phim…")
+        summary = summarize_plot(self.blocks, self.lines, self.st, ai, job, str(self.wd))
+
+        # 3. Gọi hàm generate_story_script(summary, self.st, ai, job) để có danh sách câu chuyện
+        job.progress(0.35, "AI biên kịch câu chuyện 3 hồi kịch tính…")
+        script_sentences: list[str] = []
+        try:
+            script_sentences = generate_story_script(summary, self.st, ai, job)
+        except Exception as ex:
+            job.log(f"   ⚠ Lỗi khi tạo kịch bản 3 hồi ({ex}) → chuyển về chế độ dự phòng.")
+
+        # 4. Gọi hàm match_story_to_shots để đóng gói thành các Block mới
+        if script_sentences:
+            job.log(f"   ↳ Đã tạo xong kịch bản gồm {len(script_sentences)} câu.")
+            job.progress(0.70, "Semantic Matcher: Tự động nhặt shot khớp ngữ nghĩa…")
+            try:
+                new_blocks = match_story_to_shots(script_sentences, candidate_shots, self.st)
+                if new_blocks:
+                    self.blocks = new_blocks
+                else:
+                    job.log("   ⚠ Không ghép được cảnh mới, giữ nguyên blocks cũ và viết kịch bản.")
+                    write_script(self.blocks, self.st, ai, job, self.lines, str(self.wd))
+            except Exception as ex:
+                job.log(f"   ⚠ Lỗi Matcher ({ex}) → Dùng kịch bản dự phòng cho blocks.")
+                write_script(self.blocks, self.st, ai, job, self.lines, str(self.wd))
+        else:
+            job.log("   ⚠ Không sinh được câu kịch bản → dùng bộ điều phối kịch bản dự phòng.")
+            write_script(self.blocks, self.st, ai, job, self.lines, str(self.wd))
+
+        # 5. Gán kết quả vào self.blocks và gọi self.save()
         self.save()
-        job.log(f"✔ Kịch bản: {sum(len(b.text.split()) for b in self.blocks)} từ")
+        total_words = sum(len(b.text.split()) for b in self.blocks)
+        total_dur = sum(b.dur for b in self.blocks)
+        job.log(f"✔ Kịch bản hoàn tất: {len(self.blocks)} khối · {total_words} từ · {total_dur/60:.1f} phút")
         job.progress(1.0, "Xong bước 2")
         return self.blocks
 

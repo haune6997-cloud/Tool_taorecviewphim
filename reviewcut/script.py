@@ -1,10 +1,10 @@
 """Viết kịch bản lời bình SAU KHI đã cắt cảnh, bám đúng những gì có trong từng đoạn video.
 
-* Mỗi đoạn được đưa cho AI cùng: mô tả hình (do Vision AI nhìn ảnh), thoại gốc có mốc thời gian, vị trí trong phim,
+- Mỗi đoạn được đưa cho AI cùng: mô tả hình (do Vision AI nhìn ảnh), thoại gốc có mốc thời gian, vị trí trong phim,
   giới hạn số từ theo thời lượng, và tóm tắt cốt truyện TOÀN phim (tóm tắt theo từng đoạn rồi gộp, có cache).
-* Kết quả được KIỂM TRA: chữ Hán/ngoại ngữ lẫn vào, cụm máy móc ("cảnh hành động dồn dập"…), câu/mở đầu trùng nhau,
+- Kết quả được KIỂM TRA: chữ Hán/ngoại ngữ lẫn vào, cụm máy móc ("cảnh hành động dồn dập"…), câu/mở đầu trùng nhau,
   giống nhau ≥ 60% cụm 3 từ → xin AI viết lại đúng các đoạn lỗi; vẫn lỗi thì dùng bản dự phòng cho đoạn đó.
-* Kịch bản dự phòng (không AI) ghép từ kho câu xoay vòng + thoại + mô tả hình thật, nhớ mọi câu đã dùng nên không lặp.
+- Kịch bản dự phòng (không AI) ghép từ kho câu xoay vòng + thoại + mô tả hình thật, nhớ mọi câu đã dùng nên không lặp.
 """
 from __future__ import annotations
 
@@ -257,92 +257,159 @@ def build_prompt(blocks: list[Block], st: Settings, prev: list[str], first: bool
     g = st.genre_cfg()
     items = [_item(b, st, film_len) for b in blocks]
     rules = [
-        "Mỗi đoạn 1–3 câu tiếng Việt tự nhiên như người kể chuyện review phim; số từ KHÔNG vượt 'tối_đa_từ'.",
-        "Nội dung đoạn nào phải KHỚP ĐÚNG đoạn đó: dựa vào 'các_cảnh' (điều đang nhìn thấy) và 'thoại' (điều đang được nói) của chính đoạn. "
-        "Lồng hành động nhìn thấy vào lời kể như đang kể chuyện (vd 'Hắn lao vào…', 'Cô ấy chùn bước…'), KHÔNG tả máy quay/kỹ thuật.",
-        "Chỉ dùng thông tin có trong TÓM TẮT, 'các_cảnh', 'thoại'. KHÔNG bịa tên riêng, sự kiện, địa điểm không xuất hiện ở đó. "
-        "Không biết tên thì gọi theo đặc điểm (người đàn ông áo đen, cô gái trẻ…).",
-        "Thoại có thể là ngoại ngữ/dịch thô: hãy chuyển ý sang tiếng Việt, đừng chép nguyên; câu có ★ là then chốt, nên được nhấn.",
-        "Các đoạn nối nhau thành một câu chuyện liền mạch NHƯNG mỗi đoạn mở đầu bằng cách khác nhau; không lặp lại câu/cụm từ đã dùng.",
-        "Chỉ viết tiếng Việt có dấu (tên riêng nước ngoài được giữ nguyên). Tuyệt đối không chữ Hán/Hàn/Nhật.",
-        "CẤM các cụm: " + "; ".join(f"“{b}”" for b in BANNED_PHRASES[:7]) + ", và không nhắc 'shot', 'đoạn', 'mô tả hình', 'thoại gốc'.",
+        "VĂN PHONG KỂ CHUYỆN (STORYTELLER): Bạn là người kể chuyện review phim kịch tính, cuốn hút; KHÔNG PHẢI người thuyết minh mô tả video.",
+        "CẤM TUYỆT ĐỐI TẢ ẢNH MÁY MÓC: Nghiêm cấm xuất hiện các cụm từ: 'hình ảnh cho thấy', 'chúng ta thấy', 'trước mắt', 'khung cảnh', 'màn hình', 'trong cảnh này', 'người xem', 'video cho thấy'.",
+        "BIẾN DỮ LIỆU THÀNH HÀNH ĐỘNG: Lấy dữ liệu từ 'các_cảnh' và 'thoại' để diễn giải thành diễn biến tâm lý, động cơ và xung đột thực tế của nhân vật (Ví dụ: KHÔNG VIẾT 'Hình ảnh hai robot đánh nhau sôi động', HÃY VIẾT 'Một đòn công phá cực hiểm lập tức được tung ra, dồn đối thủ vào thế ngàn cân treo sợi tóc!').",
+        "KHỐNG CHẾ ĐỘ DÀI: Mỗi đoạn viết từ 1–3 câu súc tích, nhịp văn dứt khoát, số từ TUYỆT ĐỐI KHÔNG VƯỢT 'tối_đa_từ' để vừa vặn thời lượng đọc.",
+        "BÁM SÁT CỐT TRUYỆN: Kết hợp 'TÓM TẮT' và 'thoại' để gọi đúng tên nhân vật hoặc bối cảnh. Nếu không rõ tên, hãy dùng đại từ cuốn hút (cậu thiếu niên, kẻ giấu mặt, tay súng bí ẩn). Tuyệt đối không bịa sự kiện ngoài luồng.",
+        "MẠCH TRUYỆN LIỀN MẠCH & MỞ ĐẦU BIẾN HOÁ: Các đoạn nối nhau có tính nhân - quả, dồn dập cao trào; mở đầu mỗi đoạn phải khác biệt hoàn toàn, không lặp lại cấu trúc câu.",
+        "ĐỘ AN TOÀN CHUỖI JSON: Nếu có trích dẫn lời nhân vật, bắt buộc dùng dấu nháy đơn '...' hoặc nháy góc “...”, CẤM dùng ngoặc kép thẳng (\") bên trong lời bình để tránh làm hỏng cấu trúc chuỗi JSON.",
     ]
     if first:
-        rules.append("Đoạn đầu tiên mở bằng một câu MÓC (hook) gây tò mò, gợi đúng xung đột chính của phim.")
+        rules.append("Đoạn đầu tiên: Phải là một câu MÓC (Hook) cực mạnh đánh thẳng vào xung đột gay cấn nhất để giữ chân người xem ngay giây đầu tiên.")
     if last:
-        rules.append("Đoạn cuối cùng chốt lại kết cục/cao trào và để lại dư vị hoặc một câu hỏi gợi mở.")
+        rules.append("Đoạn cuối cùng: Đưa câu chuyện đến đỉnh điểm cao trào/kết cục, để lại một câu hỏi mở hoặc nhận định sâu sắc khiến người xem suy ngẫm.")
     ctx = ""
     if summary:
-        ctx += f"TÓM TẮT CỐT TRUYỆN TOÀN PHIM (để hiểu bức tranh lớn):\n{summary}\n\n"
+        ctx += f"TÓM TẮT CỐT TRUYỆN TOÀN PHIM (Nền tảng để hiểu diễn biến):\n{summary}\n\n"
     if prev:
-        ctx += f"Lời bình đoạn ngay trước đó (để nối mạch, KHÔNG lặp lại): {json.dumps(prev[-2:], ensure_ascii=False)}\n"
+        ctx += f"Đoạn vừa kể trước đó (để nối tiếp mạch cảm xúc, không viết lùi lại): {json.dumps(prev[-2:], ensure_ascii=False)}\n"
     if used_openers:
-        ctx += f"Các kiểu mở đầu đã dùng, hãy mở khác đi: {json.dumps(used_openers[-6:], ensure_ascii=False)}\n"
+        ctx += f"Các cách mở đầu vừa dùng (hãy chọn cách mở đầu khác hẳn): {json.dumps(used_openers[-6:], ensure_ascii=False)}\n"
     if avoid:
-        ctx += "LẦN TRƯỚC CÁC ĐOẠN SAU BỊ LỖI, hãy viết lại khác hẳn: " + "; ".join(f"id {i}: {r}" for i, r in avoid.items()) + "\n"
-    return ("Bạn là biên kịch kênh REVIEW PHIM tiếng Việt. Video đã được CẮT SẴN; viết lời bình cho từng đoạn sao cho khớp đúng "
-            "hình và thoại của đoạn đó và đủ đọc trong thời lượng của nó.\n"
-            f"Phim: {st.title or '(không rõ tên – chỉ dựa vào dữ liệu bên dưới)'}\nThể loại: {st.genre}\n"
-            f"Phong cách giọng kể: {g.get('style', 'Kịch tính, cuốn hút')}\n\n{ctx}\n"
-            "QUY TẮC:\n" + "\n".join(f"- {r}" for r in rules) + "\n\nDỮ LIỆU CÁC ĐOẠN:\n" + json.dumps(items, ensure_ascii=False) +
-            '\n\nTRẢ VỀ DUY NHẤT một JSON object: {"items": [{"id": <id>, "text": "<lời bình>"}]} đủ mọi id, JSON hợp lệ.')
+        ctx += "LẦN TRƯỚC CÁC ĐOẠN SAU BỊ LỖI VĂN PHONG, hãy đổi mới hoàn toàn: " + "; ".join(f"id {i}: {r}" for i, r in avoid.items()) + "\n"
+
+    return ("Bạn là biên kịch kênh REVIEW PHIM hàng đầu. Video đã được dựng sẵn; nhiệm vụ của bạn là thổi hồn cốt truyện vào từng đoạn "
+            "sao cho kịch tính, tự nhiên, khớp cảm xúc và vừa khít thời lượng phát sóng.\n"
+            f"Tác phẩm: {st.title or '(chưa rõ tên - bám sát dữ liệu)'}\nThể loại: {st.genre}\n"
+            f"Tông giọng yêu cầu: {g.get('style', 'Kịch tính, sắc bén, cuốn hút')}\n\n{ctx}\n"
+            "NGUYÊN TẮC BẮT BUỘC:\n" + "\n".join(f"- {r}" for r in rules) + "\n\nDỮ LIỆU ĐOẠN PHIM:\n" + json.dumps(items, ensure_ascii=False) +
+            '\n\nTRẢ VỀ DUY NHẤT một JSON hợp lệ: {"items": [{"id": <id>, "text": "<lời kể chuyện review hấp dẫn>"}]} đủ mọi id. KHÔNG viết lời chào hay bọc markdown.')
 
 
 # ---------------------------------------------------------------- kịch bản dự phòng (không cần AI)
-OPEN_HOOK = ["Có những câu chuyện chỉ cần vài phút đầu đã khiến người xem không rời mắt được.",
-             "Mọi thứ bắt đầu từ một khoảnh khắc tưởng chừng bình thường, nhưng nó sẽ kéo theo cả chuỗi biến cố.",
-             "Hãy nhớ kỹ những gì sắp diễn ra, vì từng chi tiết nhỏ ở đây đều có lý do.",
-             "Câu chuyện này mở ra bằng một nút thắt mà chẳng ai lường trước được lối thoát."]
-CLOSERS = ["Mọi sợi dây cuối cùng cũng được kéo căng, và kết cục để lại một dư vị rất lâu mới tan.",
-           "Đến đây, mọi lựa chọn đều đã có cái giá của nó.",
-           "Và khi màn hình tắt đi, câu hỏi ấy vẫn còn đọng lại: nếu là bạn, bạn sẽ chọn thế nào?",
-           "Không ồn ào, nhưng cái kết ấy đủ để người xem lặng đi một lúc."]
-ANCHORS = ["Ngay lúc này", "Không lâu sau đó", "Đến đây", "Chỉ ít phút sau", "Rồi bất ngờ", "Thế nhưng", "Trong lúc đó",
-           "Sau những gì vừa xảy ra", "Càng về sau", "Tại thời điểm ấy", "Mà chưa kịp thở", "Lúc này"]
+OPEN_HOOK = [
+    "Một câu chuyện mà ngay từ những phút đầu tiên đã kéo người xem vào chuỗi bi kịch không lối thoát.",
+    "Mọi biến cố kinh hoàng nhất thực chất chỉ bắt đầu từ một khoảnh khắc tưởng như vô hại.",
+    "Hãy nhìn thật kỹ từng chi tiết ở đây, vì bất kỳ ai xuất hiện cũng có thể là kẻ nắm giữ chìa khóa sinh tử.",
+    "Câu chuyện này mở màn bằng một nút thắt nghẹt thở mà chẳng ai lường trước được cái giá phải trả.",
+    "Nếu rơi vào hoàn cảnh ngàn cân treo sợi tóc này, liệu có mấy ai dám đưa ra lựa chọn tàn nhẫn như vậy?",
+]
+
+CLOSERS = [
+    "Mọi sợi dây định mệnh cuối cùng cũng kéo căng tới mức đứt đoạn, để lại cái kết đầy ám ảnh.",
+    "Đến cuối cùng, cái giá phải trả cho từng tham vọng đều quá đắt đỏ.",
+    "Màn hình khép lại nhưng câu hỏi ấy vẫn còn day dứt: nếu đứng ở vị trí đó, bạn sẽ chọn thế nào?",
+    "Một cái kết không ồn ào nhưng đủ sức khiến bất kỳ ai theo dõi cũng phải lặng người hồi lâu.",
+    "Tất cả đã ngã ngũ, nhưng vết hằn của sự thật này chắc chắn sẽ còn kéo dài mãi về sau.",
+]
+
+ANCHORS = [
+    "Ngay khoảnh khắc này", "Chưa kịp định thần", "Bất ngờ thay", "Thế nhưng", "Tình thế lập tức đảo chiều",
+    "Không một giây do dự", "Đúng lúc dầu sôi lửa bỏng", "Biến số ập đến khi", "Và rồi chuyện gì đến cũng phải đến",
+    "Càng dấn sâu vào nguy hiểm", "Không còn đường lui", "Chỉ tích tắc sau đó",
+]
+
 PHASE_CLAUSE = {
-    "mở đầu": ["những mảnh ghép đầu tiên dần hiện ra", "thế giới của nhân vật được phác ra từng chút một",
-                "mọi chuyện mới chỉ bắt đầu nhưng không khí đã khác thường", "chưa ai biết điều gì đang chờ phía trước",
-                "các mối quan hệ lần lượt lộ diện", "một điều gì đó đã lệch khỏi quỹ đạo quen thuộc"],
-    "giữa phim": ["tình thế mỗi lúc một rối hơn", "mâu thuẫn bắt đầu lộ rõ và không ai còn đường lùi",
-                  "mỗi bước đi đều kéo theo hệ quả", "sự thật đang bị bóc ra từng lớp", "ranh giới giữa bạn và thù mờ đi",
-                  "các lựa chọn bắt đầu có giá của nó"],
-    "cao trào": ["mọi thứ dồn về một điểm bùng nổ", "chỉ một sai lầm nhỏ cũng phải trả giá đắt",
-                 "thời gian gần như không còn cho ai nữa", "những gì chôn giấu bấy lâu đều trồi lên mặt đất",
-                 "không còn chỗ nào để lẩn trốn", "mọi sợi dây đều căng đến cực hạn"],
-    "kết phim": ["bụi lắng xuống nhưng vết hằn thì còn đó", "mọi chuyện đi dần về hồi kết",
-                 "cái giá của từng quyết định mới thật sự rõ ràng", "câu trả lời gần như đã hiện ra trước mắt",
-                 "những gì còn lại là hệ quả của mọi lựa chọn trước đó", "mọi thứ chậm lại để người ta kịp nhìn lại tất cả"],
+    "mở đầu": [
+        "những mắt xích đầu tiên bắt đầu xoay chuyển báo hiệu bão táp sắp ập tới",
+        "thế giới tàn khốc của nhân vật dần lộ diện qua từng chi tiết bất thường",
+        "bầu không khí bình yên giả tạo nhanh chóng bị xé toạc",
+        "chưa một ai lường trước được cạm bẫy chết người đang giăng sẵn ngay trước mắt",
+        "từng nhân vật lần lượt bước vào ván cờ sinh tử mà không hề hay biết",
+    ],
+    "giữa phim": [
+        "vòng xoáy mâu thuẫn bắt đầu bùng lên dữ dội, cuốn phăng mọi toan tính ban đầu",
+        "ranh giới giữa đồng minh và kẻ thù ngày càng trở nên mong manh",
+        "mỗi bước đi sai lầm lúc này đều phải trả bằng cái giá cực kỳ đắt",
+        "sự thật trần trụi dần bị bóc tách, phơi bày những âm mưu thâm hiểm nhất",
+        "tình thế dồn ép khiến không một ai còn đường quay đầu lại",
+    ],
+    "cao trào": [
+        "mọi uất ức và xung đột dồn nén bấy lâu nay chính thức phát nổ",
+        "thời gian đang cạn kiệt từng giây, đẩy tất cả vào cuộc chiến một mất một còn",
+        "bản năng sinh tồn trỗi dậy khi đối mặt với hiểm cảnh nghẹt thở",
+        "không còn chỗ cho sự khoan nhượng, bất kỳ sai sót nào cũng đồng nghĩa với dấu chấm hết",
+        "ván bài sinh tử đã lật ngửa, ranh giới sống chết chỉ còn tính bằng tích tắc",
+    ],
+    "kết phim": [
+        "khói lửa dần lắng xuống, nhưng mất mát để lại thì không gì bù đắp nổi",
+        "mọi toan tính và ân oán cuối cùng cũng đi đến hồi phân định rạch ròi",
+        "cái kết đắng cay này chính là câu trả lời nghiệt ngã nhất cho mọi tham vọng",
+        "sự thật cay đắng đã phơi bày trọn vẹn, không còn gì để che giấu",
+        "hồi kết khép lại để người xem kịp nhìn nhận lại toàn bộ bi kịch vừa diễn ra",
+    ],
 }
+
 KIND_CLAUSE = {
-    "hành động": ["nhịp phim dồn dập hẳn lên", "mọi thứ bùng nổ chỉ trong vài giây", "không còn chỗ cho do dự",
-                  "mọi người buộc phải hành động ngay"],
-    "nội tâm / đối thoại cận mặt": ["phim chậm lại để nhìn thẳng vào điều nhân vật không nói ra", "một ánh mắt đã nói thay cả lời thoại",
-                                    "khoảnh khắc lặng đi nặng hơn mọi lời nói"],
-    "tối / căng thẳng": ["bầu không khí nặng nề hơn bao giờ hết", "càng đi sâu, mọi thứ càng tối và khó đoán",
-                         "sự bất an len vào từng khoảng lặng"],
-    "đối thoại": ["một cuộc trò chuyện tưởng nhẹ nhàng nhưng ẩn bên dưới là cả toan tính", "lời qua tiếng lại hé lộ thêm quan hệ giữa các bên",
-                  "từng câu nói đều mang một ý đồ"],
-    "thường": ["câu chuyện lặng lẽ xoay chuyển", "một đoạn nối nhưng không hề thừa", "mọi thứ tiếp tục tiến lên theo cách không ai ngờ"],
+    "hành động": [
+        "tiết tấu lập tức được đẩy lên mức nghẹt thở với những pha va chạm nảy lửa",
+        "một đòn phản kích sấm sét được tung ra, xé toạc thế trận giằng co",
+        "không một giây chần chừ, cuộc đối đầu bước vào giai đoạn đẫm máu",
+        "tốc độ trận chiến bị đẩy lên cực hạn khiến đối phương hoàn toàn trở tay không kịp",
+    ],
+    "nội tâm / đối thoại cận mặt": [
+        "khoảnh khắc tĩnh lặng này nặng nề hơn vạn lời nói",
+        "chỉ một ánh mắt lạnh băng cũng đủ bộc lộ dã tâm và sự giằng xé bên trong",
+        "nỗi sợ hãi và toan tính hằn rõ trên gương mặt nhân vật khi đối diện sự thật",
+    ],
+    "tối / căng thẳng": [
+        "bầu không khí u ám bao trùm, áp lực đè nặng lên từng nhịp thở",
+        "càng tiến sâu vào hiểm địa, hiểm họa rình rập càng trở nên khó lường",
+        "nỗi bất an tột cùng xâm chiếm tâm trí khi bóng tối bao vây tứ phía",
+    ],
+    "đối thoại": [
+        "cuộc chạm trán bằng lời nói này sắc bén và nguy hiểm không kém gì vũ khí",
+        "từng câu chữ thốt ra đều ngầm cài cắm toan tính hiểm độc",
+        "lời qua tiếng lại phơi bày rạn nứt không thể hàn gắn giữa hai bờ chiến tuyến",
+    ],
+    "thường": [
+        "mạch truyện lặng lẽ chuyển hướng, chuẩn bị cho bước ngoặt kế tiếp",
+        "một khoảng lặng then chốt làm tiền đề cho cơn bão ngầm sắp sửa bùng nổ",
+        "tình thế tiếp tục tiến triển theo cách không ai có thể ngờ tới",
+    ],
 }
+
 TAG_LINE = {
-    "tiết lộ": ["Một sự thật được hé lộ ngay tại đây.", "Và rồi một bí mật cuối cùng cũng lộ diện.", "Hóa ra mọi chuyện không như người ta tưởng."],
-    "phản bội": ["Niềm tin bị phá vỡ ngay trước mắt.", "Một sự phản bội lộ ra, khiến mọi thứ đảo chiều.", "Kẻ đứng sau cuối cùng cũng bị vạch mặt."],
-    "kích hoạt": ["Một thứ đã được kích hoạt, và không còn đường quay lại.", "Đồng hồ bắt đầu đếm ngược.", "Một cái nút được nhấn, mọi thứ chuyển động."],
-    "sinh tử": ["Ranh giới giữa sống và chết mong manh đến lạ.", "Cái giá lúc này là mạng sống.", "Một giây chậm trễ cũng có thể là quá muộn."],
-    "cảm xúc": ["Một lời nói chạm đúng nơi mềm yếu nhất.", "Cảm xúc dâng lên, không ai giấu nổi nữa.", "Có những lời xin lỗi đến quá muộn."],
-    "bước ngoặt": ["Một bước ngoặt bất ngờ xảy ra.", "Tình thế đảo ngược chỉ trong một câu nói.", "Đến đây thì mọi dự đoán đều sụp đổ."],
+    "tiết lộ": ["Bức màn bí mật chấn động cuối cùng cũng bị xé toạc.", "Sự thật tàn nhẫn được phơi bày khiến mọi giả thuyết sụp đổ.", "Hóa ra tất cả chỉ là một màn kịch được dàn dựng tinh vi."],
+    "phản bội": ["Nhát dao chí mạng lại đến từ chính người được tin tưởng nhất.", "Một cú lật mặt cay đắng biến niềm tin thành trò hề.", "Kẻ chủ mưu thực sự lộ diện ngay trong nội bộ."],
+    "kích hoạt": ["Ngòi nổ sinh tử đã được kích hoạt, không một thế lực nào có thể ngăn lại.", "Đồng hồ định mệnh bắt đầu đếm ngược từng giây.", "Cái bẫy chính thức sập xuống, khóa chặt mọi lối thoát."],
+    "sinh tử": ["Ranh giới giữa sự sống và cái chết chưa bao giờ mong manh đến thế.", "Chỉ cần chậm nửa bước, cái giá phải trả chính là mạng sống.", "Trong khoảnh khắc sinh tử này, chỉ có kẻ tàn nhẫn nhất mới sống sót."],
+    "cảm xúc": ["Lời trăn trối chạm trúng vết thương lòng sâu kín nhất.", "Cảm xúc dồn nén bùng nổ, không một ai có thể giữ nổi sự bình tĩnh.", "Những ân hận muộn màng giờ đây đã trở nên vô nghĩa."],
+    "bước ngoặt": ["Cục diện trận đấu bị đảo ngược hoàn toàn trong sự ngỡ ngàng.", "Một biến cố bất ngờ xảy ra, đạp đổ mọi tính toán ban đầu.", "Nước cờ táo bạo này đã làm thay đổi hoàn toàn cục diện."],
 }
-QUOTE_LEAD = ["Câu nói vang lên: “{q}”", "Và rồi nhân vật thốt ra: “{q}”", "Lời thoại then chốt đây: “{q}”", "Chỉ một câu: “{q}”"]
-SEE_LEAD = ["{c}", "Trước mắt người xem: {c}", "Lúc này, {c}", "Hình ảnh hiện lên: {c}"]
+
+QUOTE_LEAD = [
+    "Một tuyên bố đầy đanh thép vang lên: “{q}”",
+    "Lời khẳng định lạnh lùng như gáo nước lạnh: “{q}”",
+    "Câu nói then chốt làm thay đổi tất cả: “{q}”",
+    "Chỉ một câu nói đủ khiến tất cả câm lặng: “{q}”",
+]
+
+SEE_LEAD = [
+    "{c}",
+    "Ngay lập tức, {c}",
+    "Không để đối phương kịp thở, {c}",
+    "Tận dụng thời cơ, {c}",
+]
+
+
+def _clean_caption(raw_cap: str) -> str:
+    """Loại bỏ hoàn toàn các từ ngữ robot/miêu tả kỹ thuật của Vision AI."""
+    c = raw_cap.strip().rstrip(".!?…")
+    c = re.sub(r"^(hình ảnh (cho thấy|là)|chúng ta thấy|trong cảnh này|khung cảnh|màn hình xuất hiện|cảnh quay|video cho thấy)\s*", "", c, flags=re.I)
+    c = re.sub(r"\b(sôi động|sắc nét|mờ nhạt|kỹ thuật số|máy quay)\b", "", c, flags=re.I)
+    c = re.sub(r"\s+", " ", c).strip()
+    return c
 
 
 class OfflineWriter:
-    """Viết lời bình không cần AI. Nhớ mọi câu đã dùng + vài mở đầu gần nhất → không bao giờ lặp."""
+    """Viết lời bình kịch tính không cần AI. Bỏ hoàn toàn văn phong miêu tả hình ảnh."""
 
     def __init__(self, seed: int = 11):
         self.rng = random.Random(seed)
         self.used: set[str] = set()
-        self.recent: deque[str] = deque(maxlen=4)        # amorce vừa dùng → không mở đầu giống nhau liên tiếp
+        self.recent: deque[str] = deque(maxlen=4)
 
     def pick(self, pool: list[str]) -> str:
         fresh = [p for p in pool if norm_sentence(p) not in self.used]
@@ -351,7 +418,6 @@ class OfflineWriter:
         return c
 
     def varied(self, pool: list[str]) -> str:
-        """Chọn câu chưa dùng; hết thì thêm amorce thời gian để thành câu mới."""
         fresh = [p for p in pool if norm_sentence(p) not in self.used]
         if fresh:
             return self.pick(fresh)
@@ -380,28 +446,36 @@ class OfflineWriter:
         parts: list[str] = []
         if k == 0:
             parts.append(self.varied(OPEN_HOOK))
-        caps = [s.caption.strip().rstrip(".") for s in b.shots if s.caption_ai and s.caption.strip()]
-        if caps:                                              # chỉ dùng mô tả do AI NHÌN ẢNH, không dùng mô tả suy luận
-            c = self.rng.choice(caps)
-            cap, low = c[0].upper() + c[1:], c[0].lower() + c[1:]
-            parts.append(self.pick([x.format(c=cap if x.startswith("{c}") else low) for x in SEE_LEAD]).rstrip(".") + ".")
+
+        clean_caps = [_clean_caption(s.caption) for s in b.shots if s.caption_ai and _clean_caption(s.caption)]
+        if clean_caps:
+            c = self.rng.choice(clean_caps)
+            if len(c.split()) >= 3:
+                cap, low = c[0].upper() + c[1:], c[0].lower() + c[1:]
+                lead_template = self.rng.choice(SEE_LEAD)
+                built = lead_template.format(c=cap if lead_template.startswith("{c}") else low).rstrip(".") + "."
+                parts.append(built)
+
         key = max(b.dialogue, key=lambda d: d["plot"], default=None)
         if key and key["plot"] >= 0.7:
             q = key["text"].strip().rstrip(".!?… ")
             if looks_vietnamese(q) and len(q.split()) <= 18:
                 parts.append(self.pick([x.format(q=q) for x in QUOTE_LEAD]))
-            else:                                             # thoại ngoại ngữ: không chép, dùng câu theo nhãn nút thắt
+            else:
                 tag = next((t for t in ("phản bội", "tiết lộ", "kích hoạt", "sinh tử", "bước ngoặt", "cảm xúc")
                             if any(t in (s.tags or []) for s in b.shots)), "bước ngoặt")
                 parts.append(self.varied(TAG_LINE[tag]))
         elif key and looks_vietnamese(key["text"]) and len(key["text"].split()) <= 14 and self.rng.random() < 0.6:
             q = key["text"].strip().rstrip(".!?… ")
-            parts.append(self.pick([f"Có người nói: “{q}”", f"Trong khung cảnh ấy vang lên câu: “{q}”"]))
+            parts.append(self.pick([f"Nhân vật thốt lên đầy cay đắng: “{q}”", f"Giữa tình thế hiểm nghèo, câu nói vang lên: “{q}”"]))
+
         if len(parts) < 2:
             kind = b.shots[0].kind if b.shots and b.shots[0].kind in KIND_CLAUSE else "thường"
             parts.append(self.bridge(kind, phase))
+
         if k == n - 1:
             parts.append(self.varied(CLOSERS))
+
         return " ".join(parts)
 
 
@@ -428,17 +502,61 @@ def _batches(blocks: list[Block], st: Settings, film_len: float, budget: int, ma
     return out
 
 
+def _extract_items_regex(text: str) -> dict[int, str]:
+    """Cứu cánh: Dùng Regex bóc tách trực tiếp từng cặp {"id": ..., "text": "..."} khi JSON bị vỡ cú pháp."""
+    out = {}
+    pattern = re.compile(r'\{[^{}]*?"id"\s*:\s*(\d+)[^{}]*?"text"\s*:\s*"(.*?)"[^{}]*?\}', re.DOTALL)
+    for m in pattern.finditer(text):
+        try:
+            idx = int(m.group(1))
+            val = m.group(2).encode().decode('unicode_escape', errors='ignore')
+            out[idx] = re.sub(r"\s+", " ", val).strip()
+        except Exception:
+            continue
+    return out
+
+
+def _clean_json_string(s: str) -> str:
+    """Xóa bỏ các khối bọc markdown và loại bỏ trailing comma."""
+    s = re.sub(r"^```(?:json)?\s*", "", s.strip(), flags=re.I)
+    s = re.sub(r"\s*```$", "", s.strip())
+    start = s.find("{")
+    end = s.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        s = s[start:end + 1]
+    s = re.sub(r",\s*([\]}])", r"\1", s)
+    return s
+
+
 def _parse_items(raw: str) -> dict[int, str]:
-    d = parse_json(raw)
+    if not raw or not raw.strip():
+        return {}
+
+    cleaned = _clean_json_string(raw)
+    d = None
+    try:
+        d = json.loads(cleaned)
+    except Exception:
+        try:
+            d = parse_json(raw)
+        except Exception:
+            pass
+
     if isinstance(d, dict):
         d = d.get("items") or next((v for v in d.values() if isinstance(v, list)), [])
+
     out: dict[int, str] = {}
-    for it in d if isinstance(d, list) else []:
-        if isinstance(it, dict) and str(it.get("text", "")).strip():
-            try:
-                out[int(it["id"])] = re.sub(r"\s+", " ", str(it["text"])).strip()
-            except (KeyError, ValueError, TypeError):
-                continue
+    if isinstance(d, list):
+        for it in d:
+            if isinstance(it, dict) and str(it.get("text", "")).strip():
+                try:
+                    out[int(it["id"])] = re.sub(r"\s+", " ", str(it["text"])).strip()
+                except (KeyError, ValueError, TypeError):
+                    continue
+
+    if not out:
+        out = _extract_items_regex(raw)
+
     return out
 
 
@@ -464,7 +582,7 @@ def write_script(blocks: list[Block], st: Settings, ai: Optional[AIClient], job:
                                   avoid, opener_hist)
             try:
                 got = _parse_items(ai.generate([{"text": prompt}], json_mode=True, temperature=0.85 if avoid else 0.75,
-                                               max_out=min(3500, 160 * len(batch) + 300)))
+                                                max_out=min(3500, 160 * len(batch) + 300)))
             except AIUnavailable:
                 raise
             except AIError as ex:
@@ -474,11 +592,18 @@ def write_script(blocks: list[Block], st: Settings, ai: Optional[AIClient], job:
                     run_batch(batch[:h], prev, idx, avoid, depth + 1)
                     run_batch(batch[h:], [done[batch[h - 1].id]] if batch[h - 1].id in done else prev, idx, avoid, depth + 1)
                     return
+                # Nếu Groq bị lỗi cụt chữ, tự động thử đổi sang Ollama nếu có
+                if hasattr(ai, "mode") and ai.mode != "ollama" and getattr(ai, "can_ollama", False):
+                    job.log(f"   ↳ Lô {idx} lỗi ({str(ex).splitlines()[0]}) → Tự chuyển sang Ollama...")
+                    ai.mode = "ollama"
+                    run_batch(batch, prev, idx, avoid, depth + 1)
+                    return
                 job.log(f"   ⚠ Lô {idx} lỗi: {str(ex).splitlines()[0]} → dùng dự phòng cho đoạn lỗi.")
                 return
-            except ValueError as ex:
-                job.log(f"   ⚠ Lô {idx}: AI trả dữ liệu không đọc được ({ex}).")
-                return
+            except Exception as ex:
+                job.log(f"   ⚠ Lô {idx}: Dùng cứu hộ JSON ({ex}).")
+                got = _extract_items_regex(ai.generate([{"text": prompt}], json_mode=False, max_out=min(3500, 160 * len(batch) + 300)))
+
             for b in batch:
                 t = got.get(b.id)
                 if t:
@@ -533,3 +658,44 @@ def write_script(blocks: list[Block], st: Settings, ai: Optional[AIClient], job:
             b.text = ""
     job.log(f"   Kịch bản: {stats['ai']} đoạn do AI viết · {stats['retry']} lượt viết lại · {stats['offline']} đoạn dự phòng.")
     return blocks
+
+
+def generate_story_script(summary: str, st: Settings, ai: AIClient, job: Job) -> list[str]:
+    """Cho AI viết một kịch bản review phim hoàn chỉnh theo cấu trúc 3 hồi trước khi nhặt cảnh."""
+    g = st.genre_cfg()
+    num_target_sentences = max(15, min(40, int(st.target_minutes * 6)))  # ~6 câu/phút
+
+    prompt = f"""Bạn là biên kịch kênh REVIEW PHIM hàng đầu. Hãy viết kịch bản review cho bộ phim: '{st.title or 'Nội dung phim'}'.
+Thể loại: {st.genre}
+Tông giọng: {g.get('style', 'Kịch tính, cuốn hút, dồn dập')}
+
+TÓM TẮT DIỄN BIẾN TOÀN BỘ PHIM:
+{summary}
+
+YÊU CẦU BẮT BUỘC:
+1. Viết đúng {num_target_sentences} câu kể chuyện tiếng Việt liền mạch theo kết cấu 3 hồi:
+   - Câu đầu: Móc câu (Hook) gây tò mò, giật gân, cuốn hút người xem ngay lập tức.
+   - Các câu giữa: Dồn dập cao trào, đẩy mạnh xung đột, động cơ nhân vật và các nút thắt lớn.
+   - Câu cuối: Đưa ra dư vị, câu hỏi mở hoặc bài học sâu sắc.
+2. TUYỆT ĐỐI KHÔNG dùng các từ thuyết minh kỹ thuật hay tả ảnh máy móc như: "hình ảnh cho thấy", "chúng ta thấy", "trong cảnh này", "video này".
+3. Hãy kể như một câu chuyện điện ảnh thật sự (Hắn lao vào..., Bí mật rợn người bị lật mở...).
+4. Mỗi câu ngắn gọn, súc tích (12–25 từ/câu) để đọc vừa nhịp hình ảnh.
+
+TRẢ VỀ DUY NHẤT một JSON hợp lệ:
+{{"sentences": ["câu 1...", "câu 2...", "câu 3..."]}}
+KHÔNG viết lời chào hỏi hay bọc văn bản thừa."""
+
+    job.log(f"   ✍ Đang viết kịch bản dẫn đường ({num_target_sentences} câu)...")
+    res = ai.generate([{"text": prompt}], json_mode=True, max_out=4000)
+
+    cleaned = _clean_json_string(res)
+    try:
+        data = json.loads(cleaned)
+        if isinstance(data, dict) and "sentences" in data:
+            return [s.strip() for s in data["sentences"] if s.strip()]
+    except Exception:
+        pass
+
+    # Cứu hộ tách dòng nếu JSON bị lỗi
+    lines = [re.sub(r'^\d+[\.\)]\s*', '', l).strip(' ",\'') for l in res.splitlines() if len(l.strip()) > 10]
+    return lines[:num_target_sentences]
