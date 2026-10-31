@@ -64,7 +64,6 @@ def rank_norm(x: np.ndarray) -> np.ndarray:
     order = x.argsort(kind="mergesort")
     ranks = np.empty_like(order, dtype=float)
     ranks[order] = np.arange(x.size)
-    # các giá trị bằng nhau nhận cùng hạng trung bình
     _, inv, counts = np.unique(x, return_inverse=True, return_counts=True)
     sums = np.bincount(inv, weights=ranks)
     ranks = (sums / counts)[inv]
@@ -99,8 +98,7 @@ MIN_SCENE_GAP = 0.5      # giây: hai điểm cắt gần hơn mức này coi l�
 
 
 class SceneCutScanner:
-    """Chạy ffmpeg bộ lọc `scene` song song với luồng phân tích chính → điểm cắt CHÍNH XÁC tới từng khung hình
-    (bản cũ chỉ lấy mẫu 4 khung/giây nên lệch tới 0.25 s và làm shot dính vài khung của cảnh trước/sau)."""
+    """Chạy ffmpeg bộ lọc `scene` song song với luồng phân tích chính."""
 
     def __init__(self, video: str):
         self.times: list[float] = []
@@ -119,7 +117,7 @@ class SceneCutScanner:
 
     def _read(self) -> None:
         t = None
-        for raw in self.proc.stdout:                     # type: ignore[union-attr]
+        for raw in self.proc.stdout:
             line = raw.decode("utf-8", "replace")
             m = re.search(r"pts_time:([\d.]+)", line)
             if m:
@@ -132,13 +130,12 @@ class SceneCutScanner:
                 t = None
 
     def result(self, min_gap: float = MIN_SCENE_GAP) -> Optional[list[float]]:
-        """Danh sách thời điểm cắt (giây) hoặc None nếu bộ lọc không chạy được."""
         if self.proc is None:
             return None
         try:
             self.th.join(timeout=None)
             self.proc.wait(timeout=30)
-        except Exception:                                # noqa: BLE001
+        except Exception:
             self.proc.kill()
         if len(self.times) < 8:
             return None
@@ -148,7 +145,7 @@ class SceneCutScanner:
         for t, v in zip(self.times, self.scores):
             if v < thr or t < 0.3:
                 continue
-            if cuts and t - cuts[-1][0] < min_gap:        # quá gần → giữ điểm cắt mạnh hơn
+            if cuts and t - cuts[-1][0] < min_gap:
                 if v > cuts[-1][1]:
                     cuts[-1] = (t, v)
                 continue
@@ -162,7 +159,6 @@ class SceneCutScanner:
 
 
 def refine_cut(video: str, t_lo: float, t_hi: float, fps: float) -> Optional[float]:
-    """Tìm khung có thay đổi lớn nhất trong [t_lo, t_hi] (đọc đủ số khung/giây) → thời điểm cắt chính xác."""
     w, h = 160, 90
     cmd = [find_tool("ffmpeg"), "-v", "error", "-ss", f"{max(0.0, t_lo):.3f}", "-i", video, "-t", f"{t_hi - t_lo:.3f}",
            "-an", "-vf", f"scale={w}:{h}:flags=fast_bilinear,format=gray", "-f", "rawvideo", "-"]
@@ -180,9 +176,15 @@ def refine_cut(video: str, t_lo: float, t_hi: float, fps: float) -> Optional[flo
 
 
 def _face_detector():
-    path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    det = cv2.CascadeClassifier(path)
-    return det if not det.empty() else None
+    """Sử dụng MediaPipe Face Detection thay vì Haar Cascades."""
+    try:
+        import mediapipe as mp
+        return mp.solutions.face_detection.FaceDetection(
+            model_selection=0, min_detection_confidence=0.5
+        )
+    except ImportError:
+        print("CẢNH BÁO: Chưa cài thư viện MediaPipe. Chạy: pip install mediapipe")
+        return None
 
 
 def analyze_video(video: str, workdir: str, job: Job, skip_head: float = 0.0, skip_tail: float = 0.0,
@@ -202,7 +204,7 @@ def analyze_video(video: str, workdir: str, job: Job, skip_head: float = 0.0, sk
         energy[: min(len(e), len(energy))] = e[: len(energy)]
     job.check()
 
-    # ---- đọc khung hình qua ffmpeg (nhanh hơn seek bằng OpenCV)
+    # ---- đọc khung hình qua ffmpeg
     cmd = [find_tool("ffmpeg"), "-v", "error", "-i", video, "-an", "-vf",
            f"fps={SAMPLE_FPS},scale={FW}:{FH}:flags=fast_bilinear", "-pix_fmt", "bgr24", "-f", "rawvideo", "-"]
     scanner = SceneCutScanner(video)
@@ -212,6 +214,7 @@ def analyze_video(video: str, workdir: str, job: Job, skip_head: float = 0.0, sk
     hists, diffs, bright, darkf, brightf, facesz = [], [], [], [], [], []
     prev_gray, prev_hist, n = None, None, 0
     expected = max(1, int(dur * SAMPLE_FPS))
+
     try:
         while True:
             buf = proc.stdout.read(fsize)
@@ -226,22 +229,28 @@ def analyze_video(video: str, workdir: str, job: Job, skip_head: float = 0.0, sk
             hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
             h = cv2.calcHist([hsv], [0, 1], None, [16, 8], [0, 180, 0, 256])
             h = cv2.normalize(h, None, 1.0, 0.0, cv2.NORM_L1).flatten()
-            hdist = 0.0 if prev_hist is None else float(0.5 * np.abs(h - prev_hist).sum())  # 0..1
+            hdist = 0.0 if prev_hist is None else float(0.5 * np.abs(h - prev_hist).sum())
             mdiff = 0.0 if prev_gray is None else float(cv2.absdiff(gray, prev_gray).mean() / 255.0)
             hists.append(hdist)
             diffs.append(mdiff)
             bright.append(float(gray.mean()))
             darkf.append(float((gray < 50).mean()))
             brightf.append(float((gray > 200).mean()))
+
             fs = 0.0
             if det is not None and n % 2 == 0:
-                eq = cv2.equalizeHist(gray)
-                faces = det.detectMultiScale(eq, scaleFactor=1.15, minNeighbors=5, minSize=(22, 22))
-                if len(faces):
-                    fs = max(w * h_ for (_, _, w, h_) in faces) / float(FW * FH)
+                # Dùng MediaPipe nhận diện mặt
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                results = det.process(rgb)
+                if results.detections:
+                    # Chọn khuôn mặt lớn nhất bằng diện tích tương đối (0-1)
+                    largest_face = max(results.detections, key=lambda d: d.location_data.relative_bounding_box.width * d.location_data.relative_bounding_box.height)
+                    bbox = largest_face.location_data.relative_bounding_box
+                    fs = bbox.width * bbox.height
             elif facesz:
                 fs = facesz[-1] * 0.9           # giữ gần đúng ở mẫu bỏ qua
             facesz.append(fs)
+
             prev_gray, prev_hist, n = gray, h, n + 1
     except BaseException:
         scanner.stop()
@@ -258,8 +267,7 @@ def analyze_video(video: str, workdir: str, job: Job, skip_head: float = 0.0, sk
     bright, darkf, brightf, facesz = map(np.array, (bright, darkf, brightf, facesz))
     energy = energy[:n] if len(energy) >= n else np.pad(energy, (0, n - len(energy)), constant_values=energy.min() if len(energy) else -80)
 
-    # ---- phát hiện điểm cắt cảnh: (1) bộ lọc scene của ffmpeg (chính xác từng khung)
-    #      (2) histogram 4 fps; điểm cắt chỉ (2) thấy được sẽ được AFFINE lại tới từng khung → hợp nhất
+    # ---- phát hiện điểm cắt cảnh
     end_t = n / SAMPLE_FPS
     exact = scanner.result() or []
     thr = max(0.30, float(hists.mean() + 3.5 * hists.std()))
@@ -272,7 +280,7 @@ def analyze_video(video: str, workdir: str, job: Job, skip_head: float = 0.0, sk
     for i in hist_cuts:
         lo, hi = (i - 1) / SAMPLE_FPS, i / SAMPLE_FPS
         if any(lo - 0.3 <= t <= hi + 0.3 for t in exact):
-            continue                                    # đã có điểm cắt chính xác gần đó
+            continue
         t = refine_cut(video, lo - 0.08, hi + 0.08, info["fps"])
         extra.append(t if t is not None else hi)
     merged: list[float] = []
@@ -282,7 +290,8 @@ def analyze_video(video: str, workdir: str, job: Job, skip_head: float = 0.0, sk
     cut_times = [0.0] + merged + [end_t]
     job.log(f"Điểm cắt cảnh: {len(merged)} (ffmpeg scene {len(exact)} + histogram-affine {len(extra)}).")
     cut_idx = {min(n - 1, int(t * SAMPLE_FPS)) for t in cut_times[1:-1]}
-    # chuyển động: bỏ mẫu nằm ngay tại điểm cắt (nhảy cảnh ≠ chuyển động)
+
+    # chuyển động: bỏ mẫu nằm ngay tại điểm cắt
     motion = diffs.copy()
     for i in cut_idx:
         for j in (i, i + 1):
@@ -296,7 +305,7 @@ def analyze_video(video: str, workdir: str, job: Job, skip_head: float = 0.0, sk
     if auto_credits and n > SAMPLE_FPS * 120:
         is_cr = (darkf > 0.86) & (brightf > 0.002) & (brightf < 0.09)
         tail0 = int(n * 0.75)
-        csum = np.cumsum(is_cr[::-1])[::-1]               # số mẫu credits từ i tới cuối
+        csum = np.cumsum(is_cr[::-1])[::-1]
         for i in range(tail0, n):
             if csum[i] / max(1, n - i) > 0.82 and (n - i) > SAMPLE_FPS * 20:
                 credits_from = i / SAMPLE_FPS
@@ -320,7 +329,7 @@ def analyze_video(video: str, workdir: str, job: Job, skip_head: float = 0.0, sk
                    face_size=float(fsz.max()) if len(fsz) else 0.0,
                    audio=float(np.percentile(audio_rank[sl], 90)) if len(m) else 0.0,
                    dark=float(darkf[sl].mean()), brightness=float(bright[sl].mean()))
-        sc.blank = sc.brightness < 8 or (float(np.std(bright[sl])) < 1.0 and sc.brightness < 25)   # đen hẳn / màn hình phẳng
+        sc.blank = sc.brightness < 8 or (float(np.std(bright[sl])) < 1.0 and sc.brightness < 25)
         sc.credits = bool(credits_from and t0 >= credits_from - 1)
         if t1 <= head or t0 >= tail_t:
             sc.blank = True
@@ -336,7 +345,7 @@ def analyze_video(video: str, workdir: str, job: Job, skip_head: float = 0.0, sk
 
 
 def classify(s: Scene) -> str:
-    """Gắn nhãn theo chỉ số vật lý: motion cao → hành động; mặt cận + ít động → nội tâm/đối thoại."""
+    """Gắn nhãn theo chỉ số vật lý."""
     if s.blank or s.credits:
         return "bỏ qua"
     if s.motion >= 0.78:

@@ -63,7 +63,6 @@ class App(tk.Tk):
         self.v["video"].trace_add("write", lambda *a: self.after(400, self._on_video_changed))
         self.protocol("WM_DELETE_WINDOW", self._close)
 
-    # ------------------------------------------------------------ giao diện
     def _style(self):
         s = ttk.Style(self)
         s.theme_use("clam")
@@ -132,7 +131,6 @@ class App(tk.Tk):
     def _build(self):
         paned = ttk.PanedWindow(self, orient="horizontal")
         paned.pack(fill="both", expand=True)
-        # ---- trái (cuộn)
         left_outer = ttk.Frame(paned)
         cv = tk.Canvas(left_outer, bg=BG, highlightthickness=0, width=600)
         sb = ttk.Scrollbar(left_outer, orient="vertical", command=cv.yview)
@@ -144,17 +142,14 @@ class App(tk.Tk):
         cv.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
 
-        # Chặn lăn chuột làm nhảy giá trị Combobox ngoài ý muốn
         self.bind_class("TCombobox", "<MouseWheel>", lambda e: "break")
         self.bind_class("TCombobox", "<Button-4>", lambda e: "break")
         self.bind_class("TCombobox", "<Button-5>", lambda e: "break")
 
         def wheel(e):
             w = e.widget
-            # Nếu chuột đang trỏ vào bảng Treeview hoặc ô Text bên phải thì để bảng đó tự cuộn
             if isinstance(w, (ttk.Treeview, tk.Text)):
                 return
-            # Chỉ cuộn cột trái khi chuột đang nằm bên cột trái
             if str(w).startswith(str(left_outer)):
                 cv.yview_scroll(-1 if (e.num == 4 or e.delta > 0) else 1, "units")
 
@@ -369,7 +364,6 @@ class App(tk.Tk):
         sb_log.pack(side="right", fill="y")
         self._log("Sẵn sàng. Chọn video → bấm 1 để cắt cảnh trước; kịch bản chỉ được viết SAU khi đã cắt.")
 
-    # ------------------------------------------------------------ helpers
     def _genre_info(self):
         g = GENRES[self.v["genre"].get()]
         vname = VOICES[g["voice"]]["label"]
@@ -439,13 +433,11 @@ class App(tk.Tk):
         except Exception:  # noqa: BLE001
             pass
 
-    # ------------------------------------------------------------ kiểm tra kết nối
     def _check_conn(self):
         if self.busy:
             return
         st = self._collect()
         self._log("🔌 Đang kiểm tra Groq / Gemini / Ollama / giọng đọc…")
-
         def work():
             try:
                 from reviewcut import tts
@@ -459,7 +451,6 @@ class App(tk.Tk):
                 self.q.put(("diag", f"Không kiểm tra được: {ex}"))
         threading.Thread(target=work, daemon=True).start()
 
-    # ------------------------------------------------------------ hỏi khi AI đám mây lỗi (1 lần / bước)
     def _ask_from_thread(self, ctx: dict) -> str:
         holder = {"ev": threading.Event(), "ans": "offline"}
         self.q.put(("ask", (ctx, holder)))
@@ -503,7 +494,6 @@ class App(tk.Tk):
         holder["ans"] = res["v"]
         holder["ev"].set()
 
-    # ------------------------------------------------------------ xem trước hình ảnh
     def _build_preview(self, parent):
         pf = ttk.LabelFrame(parent, text="🖼 Xem trước hình ảnh (chọn 1 dòng trong bảng phân cảnh / khối kịch bản)",
                             style="Card.TLabelframe", padding=6)
@@ -528,7 +518,7 @@ class App(tk.Tk):
         self.lbl_pv = ttk.Label(bar, text="Chưa chọn shot nào. Bấm vào ảnh để xem lớn.", style="Muted.TLabel")
         self.lbl_pv.pack(side="left")
         ttk.Button(bar, text="↻ Cập nhật theo hiệu ứng hiện tại", command=self._pv_refresh).pack(side="right")
-        self.pv_paths: list[str] = []
+        self.pv_paths: list = []
 
     def _pv_dir(self) -> str:
         if self.project:
@@ -537,14 +527,19 @@ class App(tk.Tk):
         os.makedirs(d, exist_ok=True)
         return d
 
-    def _pv_show(self, paths: list[str], caps: list[str], note: str, gen: int):
+    def _pv_show(self, paths_or_imgs: list, caps: list[str], note: str, gen: int):
         if gen != self.pv_gen:
             return
-        self.pv_imgs, self.pv_paths = [], list(paths)
+        self.pv_imgs, self.pv_paths = [], list(paths_or_imgs)
         for i, lb in enumerate(self.pv_labels):
-            if i < len(paths) and paths[i]:
+            if i < len(paths_or_imgs) and paths_or_imgs[i]:
                 try:
-                    pil_img = Image.open(paths[i])
+                    img_data = paths_or_imgs[i]
+                    if isinstance(img_data, str):
+                        pil_img = Image.open(img_data)
+                    else:
+                        pil_img = img_data.copy()
+
                     if hasattr(Image, "Resampling"):
                         pil_img.thumbnail((176, 99), Image.Resampling.LANCZOS)
                     else:
@@ -554,19 +549,18 @@ class App(tk.Tk):
                     lb.configure(image=img, width=176, height=99)
                     self.pv_caps[i].config(text=caps[i])
                     continue
-                except Exception:  # noqa: BLE001
+                except Exception:
                     pass
             lb.configure(image="", width=22, height=6)
             self.pv_caps[i].config(text="")
         self.lbl_pv.config(text=note)
 
     def _pv_load(self, kind: str, obj):
-        """Tạo ảnh ở luồng nền (ffmpeg) rồi hiện lên giao diện. kind: shot | block | src."""
         st = self._collect()
         video, wd = st.video, self._pv_dir()
         self.pv_gen += 1
         gen = self.pv_gen
-        self.lbl_pv.config(text="Đang tạo ảnh xem trước…")
+        self.lbl_pv.config(text="Đang lấy ảnh vào bộ nhớ tạm (In-Memory)...")
 
         def work():
             try:
@@ -612,16 +606,21 @@ class App(tk.Tk):
         win = tk.Toplevel(self)
         win.title("Xem ảnh lớn")
         win.transient(self)
-        path = self.pv_paths[k]
+        img_data = self.pv_paths[k]
         try:
-            if sh and k < 4:                     # tạo bản lớn từ video
+            if sh and k < 4:
                 from reviewcut.vision import grab_frame
                 t = [sh.start + 0.1, (sh.start + sh.end) / 2, sh.end - 0.15][k] if k < 3 else None
-                big = os.path.join(self._pv_dir(), f"big_{k}.png")
                 if t is not None:
-                    grab_frame(self.v["video"].get(), t, big, None, width=960, fmt="png")
-                    path = big
-            pil_img = Image.open(path)
+                    big_img = grab_frame(self.v["video"].get(), t, out=None, width=960, fmt="png")
+                    if big_img:
+                        img_data = big_img
+
+            if isinstance(img_data, str):
+                pil_img = Image.open(img_data)
+            else:
+                pil_img = img_data.copy()
+
             if hasattr(Image, "Resampling"):
                 pil_img.thumbnail((960, 540), Image.Resampling.LANCZOS)
             else:
@@ -633,7 +632,6 @@ class App(tk.Tk):
         except Exception as ex:  # noqa: BLE001
             ttk.Label(win, text=f"Không mở được ảnh: {ex}").pack(padx=20, pady=20)
 
-    # ------------------------------------------------------------ chạy nền
     def _set_busy(self, b):
         self.busy = b
         for w in (self.b1, self.b2, self.b3, self.ba):
@@ -733,7 +731,6 @@ class App(tk.Tk):
         except Exception:  # noqa: BLE001
             pass
 
-    # ------------------------------------------------------------ bảng
     def _refresh(self):
         pr = self.project
         self.tv_shots.delete(*self.tv_shots.get_children())
@@ -791,7 +788,6 @@ class App(tk.Tk):
         self._refresh()
         self.tv_blocks.selection_set(str(b.id))
 
-    # ------------------------------------------------------------ nghe thử
     def _preview(self):
         self._stop_play()
         st = self._collect()

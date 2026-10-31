@@ -1,21 +1,103 @@
-"""Dựng video: hiệu ứng hình, đồng bộ shot ↔ giọng đọc, nhạc nền có ducking, phụ đề, xuất file."""
+"""Dựng video: Smart Reframe 9:16 bám nhân vật, đồng bộ shot ↔ giọng đọc, nhạc nền Audio Ducking, phụ đề, xuất file."""
 from __future__ import annotations
 
 import hashlib
 import random
 import re
+import subprocess
+import io
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from PIL import Image
+
+import cv2
+import numpy as np
 
 from .config import Settings
-from .media import Job, duration_of, find_tool, has_encoder, has_filter, probe, run
+from .media import NO_WINDOW, Job, duration_of, find_tool, has_encoder, has_filter, probe, run
 from .select import Block
 
 LEAD = 0.15           # khoảng lặng trước khi giọng vào
 TAIL = 0.25
 MAX_VOICE_SPEEDUP = 1.18
 MAX_STRETCH = 1.30    # làm chậm shot tối đa để chờ giọng đọc; quá nữa thì đứng hình đuôi
+
+_FACE_DET = None
+
+
+def _get_face_detector():
+    global _FACE_DET
+    if _FACE_DET is None:
+        try:
+            import mediapipe as mp
+            _FACE_DET = mp.solutions.face_detection.FaceDetection(
+                model_selection=0, min_detection_confidence=0.5
+            )
+        except ImportError:
+            print("CẢNH BÁO: Chưa cài thư viện MediaPipe. Chạy: pip install mediapipe")
+            _FACE_DET = False
+    return _FACE_DET if _FACE_DET is not False else None
+
+
+def detect_smart_crop_x(video: str, start: float, dur: float) -> tuple[float, float]:
+    w, h = 320, 180
+    cmd = [
+        find_tool("ffmpeg"), "-v", "error",
+        "-ss", f"{max(0.0, start):.3f}", "-t", f"{max(0.5, dur):.3f}",
+        "-i", video, "-an",
+        "-vf", f"fps=3,scale={w}:{h}:flags=fast_bilinear",
+        "-pix_fmt", "bgr24", "-f", "rawvideo", "-"
+    ]
+    try:
+        raw = subprocess.run(cmd, capture_output=True, timeout=15, creationflags=NO_WINDOW).stdout
+    except Exception:
+        return 0.5, 0.5
+
+    fsize = w * h * 3
+    nfr = len(raw) // fsize
+    if nfr < 1:
+        return 0.5, 0.5
+
+    frames = np.frombuffer(raw[: nfr * fsize], dtype=np.uint8).reshape(nfr, h, w, 3)
+    det = _get_face_detector()
+    centers: list[tuple[int, float]] = []
+
+    prev_gray = None
+    for idx in range(nfr):
+        gray = cv2.cvtColor(frames[idx], cv2.COLOR_BGR2GRAY)
+        cx = None
+        if det is not None:
+            rgb = cv2.cvtColor(frames[idx], cv2.COLOR_BGR2RGB)
+            results = det.process(rgb)
+            if results.detections:
+                largest_face = max(results.detections, key=lambda d: d.location_data.relative_bounding_box.width * d.location_data.relative_bounding_box.height)
+                bbox = largest_face.location_data.relative_bounding_box
+                cx = bbox.xmin + bbox.width / 2.0
+
+        if cx is None and prev_gray is not None:
+            diff = cv2.absdiff(gray, prev_gray)
+            col_energy = diff.mean(axis=0)
+            if col_energy.max() > 10.0:
+                weights = np.maximum(0, col_energy - col_energy.mean())
+                if weights.sum() > 0:
+                    cx = float(np.sum(np.arange(w) * weights) / (weights.sum() * w))
+        prev_gray = gray
+        if cx is not None:
+            centers.append((idx, float(np.clip(cx, 0.15, 0.85))))
+
+    if not centers:
+        return 0.5, 0.5
+    if len(centers) == 1:
+        return centers[0][1], centers[0][1]
+
+    mid = max(1, len(centers) // 2)
+    x_start = float(np.median([c[1] for c in centers[:mid]]))
+    x_end = float(np.median([c[1] for c in centers[mid:]]))
+    if abs(x_end - x_start) < 0.08:
+        avg = (x_start + x_end) / 2.0
+        return avg, avg
+    return x_start, x_end
 
 
 def canvas(aspect: str) -> tuple[int, int]:
@@ -26,10 +108,10 @@ def canvas(aspect: str) -> tuple[int, int]:
 @dataclass
 class Timing:
     block: Block
-    voice_dur: float        # độ dài giọng sau khi tăng tốc (nếu cần)
+    voice_dur: float
     atempo: float
-    eff_sum: float          # tổng độ dài shot sau speed-ramp, chưa kéo giãn
-    total: float            # độ dài khối cuối cùng
+    eff_sum: float
+    total: float
     stretch: float
     freeze: float
 
@@ -53,7 +135,6 @@ def plan_timing(blocks: list[Block], raw_voice: dict[int, float], st: Settings) 
     return out
 
 
-# ------------------------------------------------------------------ bộ lọc hình
 def _grade(g: str) -> str:
     return {
         "teal_orange": "colorbalance=rs=-0.08:gs=-0.02:bs=0.10:rm=0.05:bm=-0.04:rh=0.10:gh=0.02:bh=-0.10,"
@@ -63,21 +144,29 @@ def _grade(g: str) -> str:
     }.get(g, "")
 
 
-def video_filter(st: Settings, out_dur: float, factor: float, freeze: float, zoom_dir: int) -> str:
-    """Trả về filtergraph [0:v] -> [v]."""
+def video_filter(st: Settings, out_dur: float, factor: float, freeze: float, zoom_dir: int,
+                 smart_x: Optional[tuple[float, float]] = None) -> str:
+    """Trả về CHỈ ĐOẠN GIỮA filtergraph (KHÔNG bao gồm tag [0:v] và [v]) để nối chuỗi In-Memory."""
     W, H = canvas(st.aspect)
     chain: list[str] = []
     if st.crop_bottom:
         chain.append("crop=iw:trunc(ih*0.90/2)*2:0:0")
     chain.append(f"setpts={factor:.5f}*PTS")
     pad = ""
+    tot_frames = max(1, int(st.fps * max(0.5, out_dur)))
+
     if st.aspect == "2.39":
         cw, ch = 1920, 804
         fit = f"scale={cw}:{ch}:force_original_aspect_ratio=increase,crop={cw}:{ch}"
         pad = f"pad={W}:{H}:0:{(H - ch) // 2}:black"
     elif st.aspect == "9:16crop":
         cw, ch = W, H
-        fit = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H}"
+        if smart_x is not None:
+            x0, x1 = smart_x
+            pan_expr = f"clip((iw-{W})*({x0:.3f}+({x1 - x0:+.3f})*n/{tot_frames}),0,iw-{W})"
+            fit = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H}:x='{pan_expr}':y='(ih-{H})/2'"
+        else:
+            fit = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H}"
     elif st.aspect == "1:1":
         cw, ch = W, H
         fit = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H}"
@@ -98,7 +187,6 @@ def video_filter(st: Settings, out_dur: float, factor: float, freeze: float, zoo
     post: list[str] = []
     if st.zoom and out_dur > 0.8:
         z = 0.05
-        tot_frames = max(1, int(st.fps * out_dur))
         expr = f"max(1,(1+{z}*n/{tot_frames}))" if zoom_dir >= 0 else f"max(1,(1+{z}*(1-n/{tot_frames})))"
         post.append(f"scale=w='trunc({cw}*{expr}/2)*2':h='trunc({ch}*{expr}/2)*2':eval=frame,crop={cw}:{ch}")
 
@@ -115,7 +203,9 @@ def video_filter(st: Settings, out_dur: float, factor: float, freeze: float, zoo
     if freeze > 0.02:
         post.append(f"tpad=stop_mode=clone:stop_duration={freeze:.3f}")
     post += ["format=yuv420p", "setsar=1"]
-    return f"[0:v]{g},{','.join(post)}[v]"
+
+    # Trả nguyên body không bọc input/output label
+    return f"{g},{','.join(post)}"
 
 
 def _enc(st: Settings, crf: int) -> list[str]:
@@ -126,10 +216,16 @@ def _enc(st: Settings, crf: int) -> list[str]:
 
 def render_shot(video: str, shot, t: Timing, k: int, last_in_block: bool, st: Settings, out: str,
                 has_audio: bool, job: Job) -> None:
+    # Hàm này được giữ lại dự phòng, nhưng render chính đã gộp vào Single Pass
     ramp = max(1.0, st.speed_ramp)
     factor = t.stretch / ramp
     out_dur = shot.dur * factor + (t.freeze if last_in_block else 0.0)
-    vf = video_filter(st, shot.dur * factor, factor, t.freeze if last_in_block else 0.0, 1 if k % 2 == 0 else -1)
+    smart_x = detect_smart_crop_x(video, shot.start, shot.dur) if st.aspect == "9:16crop" else None
+
+    vf_body = video_filter(st, shot.dur * factor, factor, t.freeze if last_in_block else 0.0,
+                           1 if k % 2 == 0 else -1, smart_x=smart_x)
+    vf = f"[0:v]{vf_body}[v]"
+
     atempo = 1.0 / factor
     ff = find_tool("ffmpeg")
     cmd = [ff, "-y", "-v", "error", "-ss", f"{shot.start:.3f}", "-t", f"{shot.dur:.3f}", "-avoid_negative_ts", "make_zero", "-i", video]
@@ -143,7 +239,6 @@ def render_shot(video: str, shot, t: Timing, k: int, last_in_block: bool, st: Se
     run(cmd, job)
 
 
-# ------------------------------------------------------------------ phụ đề ASS
 def split_subtitle(text: str, max_chars: int) -> list[str]:
     text = re.sub(r"\s+", " ", text).strip()
     if not text:
@@ -216,7 +311,6 @@ def write_srt(cues: list[tuple[float, float, str]], path: str) -> None:
                           encoding="utf-8")
 
 
-# ------------------------------------------------------------------ nhạc
 def pick_music(path: str, seed: int = 0) -> Optional[str]:
     if not path:
         return None
@@ -230,13 +324,10 @@ def pick_music(path: str, seed: int = 0) -> Optional[str]:
     return None
 
 
-# ------------------------------------------------------------------ điều phối
 def render_all(video: str, blocks: list[Block], st: Settings, workdir: str, out_path: str, job: Job,
                voice_files: dict[int, str]) -> str:
     ff = find_tool("ffmpeg")
     wd = Path(workdir)
-    segd = wd / "segments"
-    segd.mkdir(exist_ok=True)
     info = probe(video)
 
     raw = {bid: duration_of(f) for bid, f in voice_files.items() if Path(f).exists()}
@@ -245,37 +336,63 @@ def render_all(video: str, blocks: list[Block], st: Settings, workdir: str, out_
     over = [t for t in timings if t.freeze > 0.5]
     job.log(f"Tổng thời lượng dự kiến {total/60:.1f} phút · {len(over)} khối lời bình dài hơn hình (đã tự chậm/đứng đuôi).")
 
-    # 1) từng shot
-    sig = hashlib.sha1(repr((st.aspect, st.resolved_grade(), st.zoom, st.speed_ramp, st.crop_bottom, st.vignette,
-                             st.grain, st.fps, st.encoder, Path(video).stat().st_size)).encode()).hexdigest()[:8]
-    segs: list[str] = []
-    n_all = sum(len(t.block.shots) for t in timings)
-    done = 0
+    # 1) & 2) GHÉP TOÀN BỘ SHOT (Single-Pass In-Memory Filtergraph - KHÔNG GHI FILE TẠM)
+    job.progress(0.1, "Dựng video (Single-pass Filtergraph - Không ghi ổ cứng)...")
+    main_mp4 = str(wd / "main_concat.mp4")
+
+    chains = []
+    concat_v = ""
+    concat_a = ""
     k = 0
+    n_all = sum(len(t.block.shots) for t in timings)
+
     for t in timings:
         for j, sh in enumerate(t.block.shots):
             job.check()
             last = j == len(t.block.shots) - 1
-            h = hashlib.sha1(f"{sig}|{sh.start:.3f}|{sh.end:.3f}|{t.stretch:.4f}|{t.freeze if last else 0:.3f}|{k % 2}".encode()).hexdigest()[:12]
-            f = str(segd / f"s_{h}.mp4")
-            if not Path(f).exists():
-                render_shot(video, sh, t, k, last, st, f, info["has_audio"], job)
-            segs.append(f)
+            ramp = max(1.0, st.speed_ramp)
+            factor = t.stretch / ramp
+            freeze = t.freeze if last else 0.0
+            out_dur = sh.dur * factor + freeze
+
+            smart_x = detect_smart_crop_x(video, sh.start, sh.dur) if st.aspect == "9:16crop" else None
+            vf_body = video_filter(st, sh.dur * factor, factor, freeze, 1 if k % 2 == 0 else -1, smart_x=smart_x)
+
+            # Cắt trực tiếp từ input gốc [0:v] (đọc từ RAM)
+            v_trim = f"[0:v]trim=start={sh.start:.3f}:duration={sh.dur:.3f},setpts=PTS-STARTPTS,{vf_body}[v{k}];"
+            chains.append(v_trim)
+            concat_v += f"[v{k}]"
+
+            if info["has_audio"]:
+                atempo = 1.0 / factor
+                af = f"[0:a]atrim=start={sh.start:.3f}:duration={sh.dur:.3f},asetpts=PTS-STARTPTS,atempo={min(2.0, max(0.5, atempo)):.4f},aresample=48000,aformat=channel_layouts=stereo[a{k}];"
+            else:
+                af = f"anullsrc=r=48000:cl=stereo:d={out_dur:.3f}[a{k}];"
+
+            chains.append(af)
+            concat_a += f"[a{k}]"
             k += 1
-            done += 1
-            job.progress(0.05 + 0.60 * done / n_all, f"Dựng shot {done}/{n_all}")
+            job.progress(0.1 + 0.5 * (k / max(1, n_all)), f"Chuẩn bị In-Memory shot {k}/{n_all}")
 
-    # 2) ghép toàn bộ shot (cùng codec/thông số nên copy được, không mã hoá lại)
-    job.check()
-    job.progress(0.66, "Ghép các shot…")
-    main_mp4 = str(wd / "main_concat.mp4")
-    _concat(segs, main_mp4, wd / "concat_list.txt", job)
+    if k > 0:
+        chains.append(f"{concat_v}concat=n={k}:v=1:a=0[main_v];")
+        chains.append(f"{concat_a}concat=n={k}:v=0:a=1[main_a]")
 
-    # 3) track giọng đọc: mỗi khối được đệm im lặng cho đủ độ dài khối → ghép thành 1 track khớp hình
+        filter_str = "".join(chains)
+        # Ghi script vào file để tránh lỗi "dòng lệnh quá dài" (Argument list too long) trên Windows
+        filter_script = wd / "filter_script.txt"
+        filter_script.write_text(filter_str, encoding="utf-8")
+
+        job.progress(0.66, "Đang Encode và nối video (chỉ quét 1 lần duy nhất)...")
+        cmd = [ff, "-y", "-v", "error", "-i", video, "-filter_complex_script", str(filter_script),
+               "-map", "[main_v]", "-map", "[main_a]", "-shortest"] + _enc(st, 16) + ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", main_mp4]
+        run(cmd, job)
+
+    # 3) track giọng đọc
     job.progress(0.72, "Dựng track giọng đọc…")
     voice_wav = _build_voice_track(timings, voice_files, wd, job)
 
-    # 4) phụ đề (ASS để đốt vào hình). SRT chỉ xuất khi người dùng bật (mặc định: kết quả chỉ là 1 file video)
+    # 4) phụ đề ASS
     ass_text, cues = build_ass(timings, st)
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -289,7 +406,7 @@ def render_all(video: str, blocks: list[Block], st: Settings, workdir: str, out_
         else:
             job.log("⚠ ffmpeg không có libass → không đốt được phụ đề lên hình.")
 
-    # 5) trộn âm thanh + Audio Ducking + (tuỳ chọn) đốt phụ đề
+    # 5) trộn âm thanh + Audio Ducking + đốt phụ đề
     job.progress(0.80, "Trộn âm thanh (Audio Ducking) & xuất file…")
     music = pick_music(st.music_path, seed=len(blocks))
     cmd = [ff, "-y", "-v", "error", "-i", main_mp4, "-i", voice_wav]
@@ -297,8 +414,6 @@ def render_all(video: str, blocks: list[Block], st: Settings, workdir: str, out_
         cmd += ["-stream_loop", "-1", "-i", music]
     fc = [f"[0:a]volume={st.orig_volume:.3f},aresample=48000,aformat=channel_layouts=stereo[o]"]
     if music:
-        # Tách giọng đọc làm 2 luồng: [vo] để mix ra ngoài, [vs] làm bộ kích hoạt sidechain
-        # Nhạc nền [m] tự động giảm khi [vs] có tiếng nói và dâng lên êm ái khi dứt câu
         fc += [
             "[1:a]asplit=2[vo][vs]",
             f"[2:a]volume={st.music_volume:.3f},aresample=48000,aformat=channel_layouts=stereo[m]",
@@ -316,7 +431,7 @@ def render_all(video: str, blocks: list[Block], st: Settings, workdir: str, out_
     cmd += ["-filter_complex", ";".join(fc), "-map", vmap, "-map", "[a]", "-shortest"]
     cmd += venc + ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-movflags", "+faststart", tmp_out]
     try:
-        run(cmd, job, cwd=str(wd))          # chạy trong workdir để tên file .ass không cần escape ký tự ổ đĩa (C:\\)
+        run(cmd, job, cwd=str(wd))
         if not Path(tmp_out).exists() or Path(tmp_out).stat().st_size < 1000:
             raise RuntimeError("ffmpeg chạy xong nhưng không tạo ra file video đầu ra.")
         Path(tmp_out).replace(out)
@@ -327,12 +442,11 @@ def render_all(video: str, blocks: list[Block], st: Settings, workdir: str, out_
 
 
 def cleanup_work(workdir: str) -> None:
-    """Xoá file tạm nặng sau khi xuất xong (cảnh đã dựng, track giọng, file ghép). Giữ kế hoạch, thoại, mô tả, cache giọng."""
     import shutil
     wd = Path(workdir)
     for name in ("segments", "voice_pieces"):
         shutil.rmtree(wd / name, ignore_errors=True)
-    for name in ("main_concat.mp4", "voice_track.wav", "concat_list.txt", "voice_list.txt", "review.ass"):
+    for name in ("main_concat.mp4", "voice_track.wav", "concat_list.txt", "voice_list.txt", "review.ass", "filter_script.txt"):
         (wd / name).unlink(missing_ok=True)
 
 
@@ -345,7 +459,6 @@ def _concat(files: list[str], out: str, list_file: Path, job: Job) -> None:
 
 
 def _build_voice_track(timings: list[Timing], voice_files: dict[int, str], wd: Path, job: Job) -> str:
-    """Mỗi khối → 1 file wav dài đúng bằng khối (giọng vào sau LEAD giây, phần còn lại im lặng), rồi nối lại."""
     ff = find_tool("ffmpeg")
     pd = wd / "voice_pieces"
     pd.mkdir(exist_ok=True)
@@ -370,13 +483,24 @@ def _build_voice_track(timings: list[Timing], voice_files: dict[int, str], wd: P
     return final
 
 
-# ------------------------------------------------------------------ xem trước 1 khung hình (có/không hiệu ứng)
-def render_preview_frame(video: str, t: float, st: Settings, out_png: str, job: Optional[Job] = None) -> str:
-    """Xuất 1 khung PNG đúng như sẽ thấy trong video: khung hình, cắt dải phụ đề, chỉnh màu, vignette, grain, zoom."""
+def render_preview_frame(video: str, t: float, st: Settings, out_png: str = None, job: Optional[Job] = None):
+    """Xuất 1 khung hiệu ứng. Nếu out_png=None, trả về PIL.Image In-Memory."""
     st2 = Settings(**{**st.__dict__})
-    st2.zoom = False                       # zoom chạy theo thời gian; ảnh tĩnh lấy khung đầu (không phóng)
+    st2.zoom = False
     st2.fps = 30
-    vf = video_filter(st2, 2.0, 1.0, 0.0, 1)
-    run([find_tool("ffmpeg"), "-y", "-v", "error", "-ss", f"{max(0.0, t):.3f}", "-i", video, "-filter_complex", vf,
-         "-map", "[v]", "-frames:v", "1", out_png], job)
-    return out_png
+    smart_x = detect_smart_crop_x(video, max(0.0, t - 0.5), 1.0) if st2.aspect == "9:16crop" else None
+
+    vf_body = video_filter(st2, 2.0, 1.0, 0.0, 1, smart_x=smart_x)
+    vf = f"[0:v]{vf_body}[v]"
+
+    if out_png is None:
+        cmd = [find_tool("ffmpeg"), "-y", "-v", "error", "-ss", f"{max(0.0, t):.3f}", "-i", video,
+               "-filter_complex", vf, "-map", "[v]", "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"]
+        proc = subprocess.run(cmd, capture_output=True, creationflags=NO_WINDOW)
+        if proc.returncode == 0 and proc.stdout:
+            return Image.open(io.BytesIO(proc.stdout))
+        return None
+    else:
+        run([find_tool("ffmpeg"), "-y", "-v", "error", "-ss", f"{max(0.0, t):.3f}", "-i", video, "-filter_complex", vf,
+             "-map", "[v]", "-frames:v", "1", out_png], job)
+        return out_png

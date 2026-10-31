@@ -105,7 +105,22 @@ def transcribe(wav: str, model: str, lang: str, device: str, job: Job, cache: Op
         for s in res["segments"]:
             if s["text"].strip():
                 lines.append(Line(round(s["start"], 2), round(s["end"], 2), s["text"].strip()))
+
     if cache:
         Path(cache).write_text(json.dumps({"model": model, "lang": lang, "lines": [l.to_dict() for l in lines]},
                                           ensure_ascii=False), encoding="utf-8")
+
+    # Dọn dẹp bộ nhớ GPU
+    try:
+        import gc
+        import torch
+        if 'wm' in locals():
+            del wm
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        job.log("   ♻ Đã giải phóng bộ nhớ GPU sau khi Whisper chạy xong.")
+    except Exception:
+        pass
+
     return lines

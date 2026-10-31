@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
@@ -47,14 +46,13 @@ class Project:
         self.st = st
         stem = re.sub(r"[^\w\-]+", "_", Path(st.video).stem)[:40]
         base = Path(st.workdir) if st.workdir else Path(st.video).parent
-        # Thư mục chứa dữ liệu tạm (cache âm thanh, phân cảnh, bản kế hoạch)
         self.wd = base / f"{stem}_reviewcut"
         self.wd.mkdir(parents=True, exist_ok=True)
         self.scenes: list[analyze.Scene] = []
         self.lines: list[Line] = []
         self.blocks: list[Block] = []
         self.duration = 0.0
-        self.asker = asker                      # hàm hỏi người dùng khi AI đám mây lỗi (do GUI/CLI cung cấp)
+        self.asker = asker
         self._ai: Optional[AIClient] = None
 
     # ------------------------------------------------------------ lưu / nạp
@@ -85,7 +83,7 @@ class Project:
         gk, mk = st.groq_key.strip() or env_key("GROQ_API_KEY"), st.gemini_key.strip() or env_key("GEMINI_API_KEY", "GOOGLE_API_KEY")
         policy = st.ai_fallback
         if not gk and not mk and policy == "ask":
-            policy = "offline"                  # chưa nhập key nào: không làm phiền; muốn dùng Ollama hãy chọn 'Tự dùng Ollama'
+            policy = "offline"
         if self._ai is None:
             self._ai = AIClient(gk, st.groq_model, st.groq_vision_model, mk, st.gemini_model, st.ollama_model, st.ollama_url,
                                 st.ollama_vision_model, policy, self.asker, groq_rpm=st.groq_rpm,
@@ -94,7 +92,7 @@ class Project:
             self._ai.begin_stage(stage, job)
         return self._ai
 
-    gemini = ai_client                          # tên cũ
+    gemini = ai_client
 
     def output_path(self) -> Path:
         """Đường dẫn file kết quả: <thư mục xuất>/<tên file>.mp4 (không ghi đè file có sẵn)."""
@@ -142,8 +140,10 @@ class Project:
 
         # chọn cảnh
         shots = plan_cut(self.scenes, tl, self.lines, st, log=job.log)
-        # mô tả thị giác trên đúng các shot đã chọn
-        caption_shots(st.video, shots, str(self.wd), None, job)
+
+        # Ép dùng Local Vision AI bằng cách truyền ai=None
+        caption_shots(st.video, shots, str(self.wd), ai=None, job=job)
+
         self.blocks = make_blocks(shots, self.lines, st)
         self.save()
         total = sum(b.dur for b in self.blocks)
@@ -163,21 +163,19 @@ class Project:
         job.progress(0.05, "Chuẩn bị AI và dữ liệu kho cảnh")
         ai = self.ai_client("script", job)
 
-        # 1. Thu thập toàn bộ các shot ứng viên cắt được ở Bước 1
+        # 1. Thu thập toàn bộ các shot ứng viên cắt được ở Bước 1 (cả main và outro)
         candidate_shots: list[Shot] = []
         seen_shots = set()
         for b in self.blocks:
             for s in b.shots:
-                sid = (round(s.start, 2), round(s.end, 2))
+                sid = (round(s.start, 2), round(s.end, 2), s.role)
                 if sid not in seen_shots:
                     seen_shots.add(sid)
-                    # Gán thoại gốc tương ứng vào shot nếu chưa có để matcher đo ngữ nghĩa
-                    if not getattr(s, "dialogue", None):
-                        s.dialogue = [
-                            {"t": l.start, "text": l.text, "plot": l.plot}
-                            for l in self.lines
-                            if s.start <= l.start <= s.end
-                        ]
+                    s.dialogue = [
+                        {"t": l.start, "text": l.text, "plot": l.plot}
+                        for l in self.lines
+                        if s.start <= l.end and l.start <= s.end
+                    ]
                     candidate_shots.append(s)
 
         job.log(f"   ↳ Kho cảnh ứng viên: {len(candidate_shots)} shot.")
@@ -186,18 +184,18 @@ class Project:
         job.progress(0.15, "AI đọc thoại & tóm tắt cốt truyện toàn phim…")
         summary = summarize_plot(self.blocks, self.lines, self.st, ai, job, str(self.wd))
 
-        # 3. Gọi hàm generate_story_script(summary, self.st, ai, job) để có danh sách câu chuyện
+        # 3. Gọi hàm generate_story_script để viết câu chuyện 3 hồi
         job.progress(0.35, "AI biên kịch câu chuyện 3 hồi kịch tính…")
         script_sentences: list[str] = []
         try:
             script_sentences = generate_story_script(summary, self.st, ai, job)
         except Exception as ex:
-            job.log(f"   ⚠ Lỗi khi tạo kịch bản 3 hồi ({ex}) → chuyển về chế độ dự phòng.")
+            job.log(f"   ⚠ Lỗi khi tạo kịch bản 3 hồi ({ex}) → chuyển về chế độ bám khối.")
 
-        # 4. Gọi hàm match_story_to_shots để đóng gói thành các Block mới
+        # 4. Gọi hàm match_story_to_shots để đối chiếu vector ngữ nghĩa + thị giác
         if script_sentences:
-            job.log(f"   ↳ Đã tạo xong kịch bản gồm {len(script_sentences)} câu.")
-            job.progress(0.70, "Semantic Matcher: Tự động nhặt shot khớp ngữ nghĩa…")
+            job.log(f"   ↳ Đã tạo xong kịch bản 3 hồi gồm {len(script_sentences)} câu.")
+            job.progress(0.70, "Semantic Matcher: Tự động nhặt shot khớp ngữ nghĩa & biểu cảm…")
             try:
                 new_blocks = match_story_to_shots(script_sentences, candidate_shots, self.st)
                 if new_blocks:
@@ -206,15 +204,15 @@ class Project:
                     job.log("   ⚠ Không ghép được cảnh mới, giữ nguyên blocks cũ và viết kịch bản.")
                     write_script(self.blocks, self.st, ai, job, self.lines, str(self.wd))
             except Exception as ex:
-                job.log(f"   ⚠ Lỗi Matcher ({ex}) → Dùng kịch bản dự phòng cho blocks.")
+                job.log(f"   ⚠ Lỗi Matcher ({ex}) → Dùng kịch bản theo khối.")
                 write_script(self.blocks, self.st, ai, job, self.lines, str(self.wd))
         else:
-            job.log("   ⚠ Không sinh được câu kịch bản → dùng bộ điều phối kịch bản dự phòng.")
+            job.log("   ⚠ Không sinh được kịch bản 3 hồi → chuyển sang viết kịch bản theo khối.")
             write_script(self.blocks, self.st, ai, job, self.lines, str(self.wd))
 
-        # 5. Gán kết quả vào self.blocks và gọi self.save()
+        # 5. Lưu kết quả
         self.save()
-        total_words = sum(len(b.text.split()) for b in self.blocks)
+        total_words = sum(len(b.text.split()) for b in self.blocks if b.role == "main")
         total_dur = sum(b.dur for b in self.blocks)
         job.log(f"✔ Kịch bản hoàn tất: {len(self.blocks)} khối · {total_words} từ · {total_dur/60:.1f} phút")
         job.progress(1.0, "Xong bước 2")
@@ -225,7 +223,7 @@ class Project:
         st = self.st
         if not self.blocks or not any(b.text.strip() for b in self.blocks if b.role == "main"):
             raise RuntimeError("Chưa có kịch bản. Chạy bước 2 hoặc nhập lời bình vào bảng.")
-        job.log("③ Lồng tiếng → dựng → trộn nhạc → phụ đề…")
+        job.log("③ Lồng tiếng → dựng (Smart Reframe + Audio Ducking) → phụ đề…")
         items, files = [], {}
         for b in self.blocks:
             if b.role == "main" and b.text.strip():
